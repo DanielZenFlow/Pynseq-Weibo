@@ -527,8 +527,16 @@ assert.equal(
   '设置向导',
   'the onboarding launcher must be the first section on the General tab'
 );
-assert.match(source, /@version\s+2\.3\.4/);
-assert.match(source, /const SCRIPT_VERSION = '2\.3\.4'/);
+assert.match(
+  generalSettingsSection,
+  /id="wbset-hide-timeline-recommendations"/
+);
+assert.match(
+  source,
+  /hideTimelineRecommendations:\s*true/
+);
+assert.match(source, /@version\s+2\.3\.5/);
+assert.match(source, /const SCRIPT_VERSION = '2\.3\.5'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
@@ -568,6 +576,10 @@ const onboardingSource = sourceBetween(
   '  function openOnboarding(',
   '  function openPanel('
 );
+assert.match(
+  onboardingSource,
+  /data-wbset-setting="hideTimelineRecommendations"/
+);
 const onboardingSettingKeys = Array.from(
   new Set(
     Array.from(
@@ -585,6 +597,7 @@ assert.deepEqual(onboardingSettingKeys, [
   'hideBlacklistPosts',
   'hideBlacklistSearchResults',
   'hideBlacklistUserCards',
+  'hideTimelineRecommendations',
   'showSettingsButton',
 ]);
 const onboardingFinishSource = sourceBetween(
@@ -1707,6 +1720,11 @@ assert.ok(
     runtimeApplySource.indexOf('hideBlockedDOMPosts(document)'),
   'scope changes must restore previously hidden roots before reapplying enabled filters'
 );
+assert.ok(
+  runtimeApplySource.indexOf('restoreTimelineRecommendations(document)') <
+    runtimeApplySource.indexOf('hideBlockedDOMPosts(document)'),
+  'disabling timeline recommendations must restore hidden rows before filters are reapplied'
+);
 assert.doesNotMatch(
   source,
   /VIRTUAL_COMPACTION|COMPACTED_VIRTUAL|applyVirtual(?:Item|Wrapper)Compaction|clearVirtualCompactionState/
@@ -1816,11 +1834,13 @@ const configContext = vm.createContext({
   WB_CONFIG_SCHEMA_VERSION: 1,
   WB_CONFIG_DEFAULTS: {
     hideAds: true,
+    hideTimelineRecommendations: true,
     hideNavVideo: false,
     hideNavRecommend: false,
   },
   WB_CONFIG_BOOLEAN_KEYS: [
     'hideAds',
+    'hideTimelineRecommendations',
     'hideNavVideo',
     'hideNavRecommend',
   ],
@@ -1857,6 +1877,7 @@ const migratedConfig = JSON.parse(
 );
 assert.equal(migratedConfig.schemaVersion, 1);
 assert.equal(migratedConfig.hideAds, true);
+assert.equal(migratedConfig.hideTimelineRecommendations, true);
 assert.equal(migratedConfig.hideNavVideo, true);
 assert.equal(migratedConfig.hideNavRecommend, true);
 assert.equal('hideNavVideoRecommend' in migratedConfig, false);
@@ -2065,6 +2086,29 @@ assert.match(
   runtimeCSSSource,
   /vue-recycle-scroller__item-view"\] > \$\{HIDDEN_AD_SELECTOR\}/
 );
+assert.match(
+  runtimeCSSSource,
+  /vue-recycle-scroller__item-view"\] > \$\{HIDDEN_TIMELINE_RECOMMENDATION_SELECTOR\}/
+);
+const timelineRecommendationSource = sourceBetween(
+  '  function hasTimelineRecommendationLabel(',
+  '  function hideBlockedSearchResultCards('
+);
+assert.match(timelineRecommendationSource, /article\.firstElementChild/);
+assert.match(timelineRecommendationSource, /child\.querySelector\('header'\)/);
+assert.match(
+  timelineRecommendationSource,
+  /getOwnDOMText\(label\) === TIMELINE_RECOMMENDATION_LABEL/
+);
+assert.doesNotMatch(timelineRecommendationSource, /_title_[A-Za-z0-9]+/);
+assert.match(
+  timelineRecommendationSource,
+  /target\.setAttribute\(HIDDEN_TIMELINE_RECOMMENDATION_ATTR, '1'\)[\s\S]*?requestNativeVirtualItemRemeasure\(target\)/
+);
+assert.match(
+  timelineRecommendationSource,
+  /node\.removeAttribute\(HIDDEN_TIMELINE_RECOMMENDATION_ATTR\)[\s\S]*?requestNativeVirtualItemRemeasure\(node\)/
+);
 // 回收壳上的广告标记必须重新验证，否则复用后的正常微博会继续被隐藏。
 const recycledAdSource = sourceBetween(
   '  function restoreRecycledVirtualAdShells(scope) {',
@@ -2081,6 +2125,220 @@ assert.match(
     '  function hideBlockedDOMPosts('
   ),
   /restoreRecycledVirtualAdShells\(scope\);/
+);
+const recycledTimelineRecommendationSource = sourceBetween(
+  '  function restoreRecycledVirtualTimelineRecommendationShells(scope) {',
+  '  function restoreRecycledVirtualContentShells('
+);
+assert.match(
+  recycledTimelineRecommendationSource,
+  /!stillLooksLikeTimelineRecommendation\(node\)[\s\S]*?node\.removeAttribute\(HIDDEN_TIMELINE_RECOMMENDATION_ATTR\)[\s\S]*?requestNativeVirtualItemRemeasure\(node\)/
+);
+assert.match(
+  sourceBetween(
+    '  function restoreRecycledVirtualContentShells(',
+    '  function hideBlockedDOMPosts('
+  ),
+  /restoreRecycledVirtualTimelineRecommendationShells\(scope\);/
+);
+
+class FakeTimelineRecommendationElement {
+  constructor(tagName, text = '', parentElement = null) {
+    this.tagName = String(tagName || '').toUpperCase();
+    this.parentElement = parentElement;
+    this.children = [];
+    this.childNodes = text
+      ? [{ nodeType: 3, textContent: text }]
+      : [];
+    this.attributes = new Map();
+    if (parentElement) parentElement.children.push(this);
+  }
+
+  get firstElementChild() {
+    return this.children[0] || null;
+  }
+
+  matches(selector) {
+    return String(selector)
+      .split(',')
+      .map((part) => part.trim())
+      .some((part) => {
+        if (part === 'article') return this.tagName === 'ARTICLE';
+        if (part === 'header') return this.tagName === 'HEADER';
+        if (part === 'span') return this.tagName === 'SPAN';
+        if (part === 'div') return this.tagName === 'DIV';
+        if (part === 'virtual-view') return this.tagName === 'VIRTUAL-VIEW';
+        if (part === '[data-rec]') return this.attributes.has('data-rec');
+        return false;
+      });
+  }
+
+  closest(selector) {
+    let current = this;
+    while (current) {
+      if (current.matches(selector)) return current;
+      current = current.parentElement;
+    }
+    return null;
+  }
+
+  querySelectorAll(selector) {
+    const matches = [];
+    const visit = (node) => {
+      node.children.forEach((child) => {
+        if (child.matches(selector)) matches.push(child);
+        visit(child);
+      });
+    };
+    visit(this);
+    return matches;
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] || null;
+  }
+
+  hasAttribute(name) {
+    return this.attributes.has(name);
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(name, String(value));
+  }
+
+  removeAttribute(name) {
+    this.attributes.delete(name);
+  }
+}
+
+class FakeTimelineRecommendationDocument {
+  constructor(children) {
+    this.children = children;
+  }
+
+  querySelectorAll(selector) {
+    const matches = [];
+    const visit = (node) => {
+      if (node.matches(selector)) matches.push(node);
+      node.children.forEach(visit);
+    };
+    this.children.forEach(visit);
+    return matches;
+  }
+}
+
+const recommendationView = new FakeTimelineRecommendationElement('virtual-view');
+const recommendationShell = new FakeTimelineRecommendationElement(
+  'div',
+  '',
+  recommendationView
+);
+const recommendationArticle = new FakeTimelineRecommendationElement(
+  'article',
+  '',
+  recommendationShell
+);
+const recommendationLead = new FakeTimelineRecommendationElement(
+  'div',
+  '',
+  recommendationArticle
+);
+const recommendationLabel = new FakeTimelineRecommendationElement(
+  'span',
+  '你可能感兴趣的内容',
+  recommendationLead
+);
+const recommendationBody = new FakeTimelineRecommendationElement(
+  'div',
+  '',
+  recommendationArticle
+);
+new FakeTimelineRecommendationElement('header', '', recommendationBody);
+
+const normalView = new FakeTimelineRecommendationElement('virtual-view');
+const normalShell = new FakeTimelineRecommendationElement('div', '', normalView);
+const normalArticle = new FakeTimelineRecommendationElement(
+  'article',
+  '',
+  normalShell
+);
+const normalBody = new FakeTimelineRecommendationElement('div', '', normalArticle);
+new FakeTimelineRecommendationElement('header', '', normalBody);
+new FakeTimelineRecommendationElement(
+  'span',
+  '你可能感兴趣的内容',
+  normalBody
+);
+new FakeTimelineRecommendationElement('div', '', normalArticle);
+
+const recommendationDocument = new FakeTimelineRecommendationDocument([
+  recommendationView,
+  normalView,
+]);
+const recommendationRemeasures = [];
+const recommendationContext = vm.createContext({
+  CONTENT_FILTER_CFG: { hideTimelineRecommendations: true },
+  Element: FakeTimelineRecommendationElement,
+  HIDDEN_TIMELINE_RECOMMENDATION_ATTR: 'data-rec',
+  HIDDEN_TIMELINE_RECOMMENDATION_SELECTOR: '[data-rec]',
+  Node: { TEXT_NODE: 3 },
+  TIMELINE_RECOMMENDATION_LABEL: '你可能感兴趣的内容',
+  VIRTUAL_VIEW_SELECTOR: 'virtual-view',
+  document: recommendationDocument,
+  findHideShell: (article) => article.parentElement,
+  isRelationshipListPage: () => false,
+  pauseVideosIn: () => {},
+  requestNativeVirtualItemRemeasure: (node) =>
+    recommendationRemeasures.push(node),
+});
+vm.runInContext(
+  `${sourceBetween(
+    '  function normDOMText(s) {',
+    '  function isRelationshipListPage() {'
+  )}
+  ${sourceBetween(
+    '  function getOwnDOMText(el) {',
+    '  const BAD_USER_NAME_TEXT ='
+  )}
+  ${timelineRecommendationSource}
+  ${sourceBetween(
+    '  function stillLooksLikeTimelineRecommendation(node) {',
+    '  function restoreRecycledVirtualAdShells(scope) {'
+  )}
+  ${recycledTimelineRecommendationSource}
+  globalThis.testRecommendationAPI = {
+    findTimelineRecommendationArticles,
+    hideTimelineRecommendations,
+    restoreTimelineRecommendations,
+    restoreRecycledVirtualTimelineRecommendationShells,
+  };`,
+  recommendationContext
+);
+const recommendationAPI = recommendationContext.testRecommendationAPI;
+assert.equal(
+  recommendationAPI.findTimelineRecommendationArticles(recommendationDocument)
+    .length,
+  1,
+  'only a native leading recommendation title may classify a timeline article'
+);
+assert.equal(recommendationAPI.hideTimelineRecommendations(recommendationDocument), true);
+assert.equal(recommendationShell.hasAttribute('data-rec'), true);
+assert.equal(normalShell.hasAttribute('data-rec'), false);
+assert.equal(recommendationRemeasures.at(-1), recommendationShell);
+recommendationContext.CONTENT_FILTER_CFG.hideTimelineRecommendations = false;
+recommendationAPI.restoreTimelineRecommendations(recommendationDocument);
+assert.equal(recommendationShell.hasAttribute('data-rec'), false);
+assert.equal(recommendationRemeasures.at(-1), recommendationShell);
+recommendationContext.CONTENT_FILTER_CFG.hideTimelineRecommendations = true;
+recommendationAPI.hideTimelineRecommendations(recommendationDocument);
+recommendationLabel.childNodes[0].textContent = '普通微博';
+recommendationAPI.restoreRecycledVirtualTimelineRecommendationShells(
+  recommendationShell
+);
+assert.equal(
+  recommendationShell.hasAttribute('data-rec'),
+  false,
+  'a recycled virtual shell must recover when it no longer contains the native recommendation title'
 );
 const nativeHomeSource = sourceBetween(
   '  function openNativeHomeTimeline() {',

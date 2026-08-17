@@ -13,7 +13,7 @@
 - 在搜索结果、用户卡片、推荐项、转发用户列表和点赞用户列表中过滤名单用户。
 - 在可识别的用户名上提供右键菜单，可只加入本地屏蔽名单，或同时加入新浪微博官方黑名单。
 - 支持分别控制微博与转发、评论与回复、搜索结果、用户卡片与推荐项、互动列表五类屏蔽范围。
-- 支持隐藏广告与推广微博、搜索页相关用户、微博热搜及多个导航和侧栏模块。
+- 支持独立隐藏时间线中的“你可能感兴趣的内容”、广告与推广微博、搜索页相关用户、微博热搜及多个导航和侧栏模块。
 - 提供五步首次设置向导、右下角快捷设置按钮，以及 Tampermonkey「设置」「关于」菜单。
 - 支持搜索、分页、手动添加、移除、清空、导入和导出本地屏蔽名单。
 - 支持增量同步、同步前五页和完整同步新浪微博官方黑名单。
@@ -115,7 +115,7 @@
 - Filters blocked users from search results, user cards, recommendations, repost lists, and like lists.
 - Adds a context menu to identifiable usernames for local blocking or optional simultaneous addition to Weibo's official blocklist.
 - Provides separate filtering controls for posts and reposts, comments and replies, search results, user cards and recommendations, and interaction lists.
-- Hides identifiable ads and promotions, related-user panels, trending topics, and selected navigation or sidebar modules.
+- Independently hides “You may be interested” timeline recommendations, identifiable ads and promotions, related-user panels, trending topics, and selected navigation or sidebar modules.
 - Includes a five-step onboarding flow, a quick-settings button, and “Settings” and “About” Tampermonkey menu entries.
 - Supports searching, pagination, manual entry, removal, clearing, importing, and exporting of the local blocklist.
 - Synchronizes the first page, first five pages, or all readable pages of Weibo's official blocklist.
