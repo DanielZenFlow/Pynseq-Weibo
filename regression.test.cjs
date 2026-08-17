@@ -3,6 +3,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
+(async () => {
+
 const scriptPath = path.join(
   __dirname,
   'pynseq-for-weibo.user.js'
@@ -50,8 +52,8 @@ assert.match(source, /function\s+showNotification\s*\(/);
 assert.match(source, /WB_INTERNAL\.notify\s*=\s*showNotification/);
 assert.match(source, /const GITHUB_URL = 'https:\/\/github\.com\/DanielZenFlow\/Pynseq-Weibo'/);
 const filteredUsersParserSource = sourceBetween(
-  '  function normalizeSyncCursor(value) {',
-  '  function buildFilteredUsersURL(page, cursor) {'
+  '  function hasNextFilteredUsersPage(value) {',
+  '  function buildFilteredUsersURL(page) {'
 );
 const filteredUsersParserContext = {};
 vm.runInNewContext(
@@ -75,12 +77,142 @@ assert.equal(
   filteredUsersParserContext.parseFilteredUsers(
     { ok: 1, card_group: [], next_cursor: 0 },
     '测试'
-  ).nextCursor,
-  ''
+  ).hasNextPage,
+  false
+);
+assert.equal(
+  filteredUsersParserContext.parseFilteredUsers(
+    { ok: 1, card_group: [{}], next_cursor: 1 },
+    '测试'
+  ).hasNextPage,
+  true
+);
+assert.equal(
+  filteredUsersParserContext.parseFilteredUsers(
+    { ok: 1, card_group: [{}], next_cursor: 1, total: 0 },
+    '测试'
+  ).hasNextPage,
+  false
 );
 assert.equal(
   (source.match(/const parsed = parseFilteredUsersResponse\(data,/g) || []).length,
   3
+);
+const filteredUsersPaginationSource = sourceBetween(
+  '  function extractUIDFromScheme(item) {',
+  '  let BL = new Set();'
+);
+const paginationRequests = [];
+let paginationResponses = [];
+const filteredUsersPaginationContext = vm.createContext({
+  MAX_418: 3,
+  MAX_FULL_SYNC_PAGES: 20,
+  SETTING_API_HOST_ERROR: 'host error',
+  THROTTLE_MS: 350,
+  WB_BL_NATIVE: {
+    fetch: async (url) => {
+      paginationRequests.push(url);
+      const data = paginationResponses.shift();
+      if (!data) throw new Error(`unexpected request: ${url}`);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => data,
+      };
+    },
+  },
+  canUseSettingApi: () => true,
+  commitSyncedLocalBL: async (workingSet) => new Set(workingSet),
+  readLocalBLExclusions: () => new Set(),
+  replaceSetContents: (target, values) => {
+    target.clear();
+    values.forEach((value) => target.add(value));
+    return target;
+  },
+  sleep: async () => {},
+  throwIfSyncAborted: () => {},
+});
+vm.runInContext(
+  `${filteredUsersPaginationSource}
+  globalThis.testFilteredUsersPagination = { fullSync, deltaSync, syncPages };`,
+  filteredUsersPaginationContext
+);
+const paginationAPI =
+  filteredUsersPaginationContext.testFilteredUsersPagination;
+const pagedResponses = () => [
+  {
+    ok: 1,
+    card_group: [{ scheme: 'sinaweibo://userinfo?uid=10001' }],
+    next_cursor: 1,
+    total: 3,
+  },
+  {
+    ok: 1,
+    card_group: [{ scheme: 'sinaweibo://userinfo?uid=10002' }],
+    next_cursor: 1,
+    total: 3,
+  },
+  {
+    ok: 1,
+    card_group: [{ scheme: 'sinaweibo://userinfo?uid=10003' }],
+    next_cursor: 0,
+    total: 3,
+  },
+];
+
+paginationResponses = pagedResponses();
+paginationRequests.length = 0;
+const fullSyncResult = await paginationAPI.fullSync();
+assert.deepEqual(Array.from(fullSyncResult), ['10001', '10002', '10003']);
+assert.deepEqual(paginationRequests, [
+  '/ajax/setting/getFilteredUsers?page=1',
+  '/ajax/setting/getFilteredUsers?page=2',
+  '/ajax/setting/getFilteredUsers?page=3',
+]);
+assert.equal(
+  paginationRequests.some((url) => url.includes('cursor=')),
+  false,
+  'official blacklist pagination must use page numbers only'
+);
+
+paginationResponses = pagedResponses();
+paginationRequests.length = 0;
+const pagedSyncSet = new Set();
+assert.equal(await paginationAPI.syncPages(pagedSyncSet, 5), 3);
+assert.deepEqual(Array.from(pagedSyncSet), ['10001', '10002', '10003']);
+assert.deepEqual(paginationRequests, [
+  '/ajax/setting/getFilteredUsers?page=1',
+  '/ajax/setting/getFilteredUsers?page=2',
+  '/ajax/setting/getFilteredUsers?page=3',
+]);
+
+paginationResponses = [
+  {
+    ok: 1,
+    card_group: [{ scheme: 'sinaweibo://userinfo?uid=10004' }],
+    next_cursor: 1,
+  },
+];
+paginationRequests.length = 0;
+const deltaSet = await paginationAPI.deltaSync(new Set());
+assert.deepEqual(Array.from(deltaSet), ['10004']);
+assert.deepEqual(paginationRequests, [
+  '/ajax/setting/getFilteredUsers?page=1',
+]);
+
+paginationResponses = [
+  {
+    ok: 1,
+    card_group: [],
+    next_cursor: 1,
+  },
+];
+paginationRequests.length = 0;
+assert.equal(await paginationAPI.syncPages(new Set(), 5), 0);
+assert.equal(
+  paginationRequests.length,
+  1,
+  'an empty page must terminate pagination even when next_cursor stays truthy'
 );
 const observerSource = sourceBetween(
   '      observer.observe(root, {',
@@ -535,8 +667,8 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+2\.3\.5/);
-assert.match(source, /const SCRIPT_VERSION = '2\.3\.5'/);
+assert.match(source, /@version\s+2\.3\.6/);
+assert.match(source, /const SCRIPT_VERSION = '2\.3\.6'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
@@ -2605,3 +2737,8 @@ assert.equal(
   false
 );
 console.log('regression tests: PASS');
+
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
