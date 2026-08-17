@@ -4,7 +4,7 @@
 // @name:zh-CN   Pynseq for Weibo｜屏序·微博
 // @name:en      Pynseq for Weibo｜屏序·微博
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
-// @version      2.3.4
+// @version      2.3.5
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
 // @description:en Restore a chronological Weibo timeline, locally block unwanted users, filter ads, simplify navigation, and manage official Weibo blocklist synchronization.
 // @author       DanielZenFlow
@@ -41,7 +41,7 @@
   const WB_INTERNAL = Object.create(null);
   const THROTTLE_MS = 350; // 新浪微博官方黑名单分页请求间隔（毫秒）
   const SCRIPT_NAME = 'Pynseq for Weibo｜屏序·微博';
-  const SCRIPT_VERSION = '2.3.4';
+  const SCRIPT_VERSION = '2.3.5';
   const GITHUB_URL = 'https://github.com/DanielZenFlow/Pynseq-Weibo';
   const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/danielzenflow';
   const ONBOARDING_DONE_KEY = 'pynseq_for_weibo_onboarding_done_v1';
@@ -68,6 +68,7 @@
     hideBlacklistInteractions: true,
     confirmBeforeBlocking: true,
     hideAds: true,
+    hideTimelineRecommendations: true,
     showSettingsButton: true,
   });
   const WB_CONFIG_BOOLEAN_KEYS = Object.keys(WB_CONFIG_DEFAULTS);
@@ -1032,6 +1033,7 @@
     hideBlacklistUserCards: true,
     hideBlacklistInteractions: true,
     hideAds: true,
+    hideTimelineRecommendations: true,
   };
   const CONTENT_FILTER_CFG = (() => {
     const cfg = WB_INTERNAL.config.read();
@@ -1045,6 +1047,16 @@
   const BLOCKED_CONTENT_HIDE_SELECTOR = `[${BLOCKED_CONTENT_HIDE_ATTR}]`;
   const HIDDEN_AD_ATTR = 'data-__wb_ad_hidden_by_userscript';
   const HIDDEN_AD_SELECTOR = `[${HIDDEN_AD_ATTR}]`;
+  const HIDDEN_TIMELINE_RECOMMENDATION_ATTR =
+    'data-__wb_timeline_recommendation_hidden_by_userscript';
+  const HIDDEN_TIMELINE_RECOMMENDATION_SELECTOR =
+    `[${HIDDEN_TIMELINE_RECOMMENDATION_ATTR}]`;
+  const TIMELINE_RECOMMENDATION_LABEL = '你可能感兴趣的内容';
+  const HIDDEN_FEED_CONTENT_SELECTOR = [
+    BLOCKED_CONTENT_HIDE_SELECTOR,
+    HIDDEN_AD_SELECTOR,
+    HIDDEN_TIMELINE_RECOMMENDATION_SELECTOR,
+  ].join(',');
   const USER_SCRIPT_UI_SELECTOR = [
     '.wbset-panel',
     '.wbset-btn',
@@ -1923,10 +1935,21 @@
         border: 0 !important;
         overflow: hidden !important;
       }
+      ${HIDDEN_TIMELINE_RECOMMENDATION_SELECTOR} {
+        display: none !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 0 !important;
+        overflow: hidden !important;
+      }
       .vue-recycle-scroller__item-view > ${BLOCKED_CONTENT_HIDE_SELECTOR},
       [class*="vue-recycle-scroller__item-view"] > ${BLOCKED_CONTENT_HIDE_SELECTOR},
       .vue-recycle-scroller__item-view > ${HIDDEN_AD_SELECTOR},
-      [class*="vue-recycle-scroller__item-view"] > ${HIDDEN_AD_SELECTOR} {
+      [class*="vue-recycle-scroller__item-view"] > ${HIDDEN_AD_SELECTOR},
+      .vue-recycle-scroller__item-view > ${HIDDEN_TIMELINE_RECOMMENDATION_SELECTOR},
+      [class*="vue-recycle-scroller__item-view"] > ${HIDDEN_TIMELINE_RECOMMENDATION_SELECTOR} {
         /*
          * DynamicScroller ignores a measured size of exactly 0 and keeps the
          * previous cached row height, which leaves a large blank slot. Keep a
@@ -2043,6 +2066,7 @@
     updateRuntimeStyles();
     restoreBlockedContentHideState(document);
     restoreRecognizedAds(document);
+    restoreTimelineRecommendations(document);
     hideBlockedDOMPosts(document);
     compactVirtualScrollerGaps(document);
     scheduleBlockedDOMRefresh();
@@ -2857,6 +2881,7 @@
 
   function restoreHiddenRelationshipItems(root = document, options = {}) {
     syncRelationshipPageMode();
+    restoreTimelineRecommendations(document);
     if (!isRelationshipListPage() || !document.querySelectorAll) return;
     document
       .querySelectorAll(`[${TIMELINE_LOADER_NUDGE_ATTR}]`)
@@ -3502,11 +3527,11 @@
     if (isRelationshipListPage()) return false;
     if (!root || !root.querySelectorAll) return false;
     const nodes = [];
-    if (root instanceof Element && root.matches(BLOCKED_CONTENT_HIDE_SELECTOR)) {
+    if (root instanceof Element && root.matches(HIDDEN_FEED_CONTENT_SELECTOR)) {
       nodes.push(root);
     }
     root
-      .querySelectorAll(BLOCKED_CONTENT_HIDE_SELECTOR)
+      .querySelectorAll(HIDDEN_FEED_CONTENT_SELECTOR)
       .forEach((node) => nodes.push(node));
     return nodes.some((node) => !isInsideCommentContentRoot(node));
   }
@@ -4526,6 +4551,91 @@
     });
   }
 
+  function hasTimelineRecommendationLabel(article) {
+    if (!(article instanceof Element) || !article.matches('article')) {
+      return false;
+    }
+    const lead = article.firstElementChild;
+    if (!(lead instanceof Element)) return false;
+    const body = Array.from(article.children)
+      .slice(1)
+      .find(
+        (child) => child.matches('header') || child.querySelector('header')
+      );
+    if (
+      !(body instanceof Element) ||
+      lead.matches('header') ||
+      lead.querySelector('header')
+    ) {
+      return false;
+    }
+    const labels = [lead, ...lead.querySelectorAll('span, div')];
+    return labels.some(
+      (label) =>
+        label.closest('article') === article &&
+        getOwnDOMText(label) === TIMELINE_RECOMMENDATION_LABEL
+    );
+  }
+
+  function findTimelineRecommendationArticles(root = document) {
+    if (!root || !root.querySelectorAll) return [];
+    const articles = new Set();
+    if (root instanceof Element) {
+      const containing = root.closest('article');
+      if (containing) articles.add(containing);
+      if (root.matches('article')) articles.add(root);
+    }
+    root.querySelectorAll('article').forEach((article) => articles.add(article));
+    return Array.from(articles).filter(hasTimelineRecommendationLabel);
+  }
+
+  function hideTimelineRecommendations(root = document) {
+    if (isRelationshipListPage()) {
+      restoreTimelineRecommendations(document);
+      return false;
+    }
+    if (
+      !CONTENT_FILTER_CFG.hideTimelineRecommendations ||
+      !root ||
+      !root.querySelectorAll
+    ) {
+      return false;
+    }
+    let hiddenAny = false;
+    findTimelineRecommendationArticles(root).forEach((article) => {
+      const target = findHideShell(article);
+      if (
+        !(target instanceof Element) ||
+        target.hasAttribute(HIDDEN_TIMELINE_RECOMMENDATION_ATTR)
+      ) {
+        return;
+      }
+      pauseVideosIn(target);
+      target.setAttribute(HIDDEN_TIMELINE_RECOMMENDATION_ATTR, '1');
+      requestNativeVirtualItemRemeasure(target);
+      hiddenAny = true;
+    });
+    return hiddenAny;
+  }
+
+  function restoreTimelineRecommendations(root = document) {
+    if (!root || !root.querySelectorAll) return;
+    const nodes = [];
+    if (
+      root instanceof Element &&
+      root.matches(HIDDEN_TIMELINE_RECOMMENDATION_SELECTOR)
+    ) {
+      nodes.push(root);
+    }
+    root
+      .querySelectorAll(HIDDEN_TIMELINE_RECOMMENDATION_SELECTOR)
+      .forEach((node) => nodes.push(node));
+    Array.from(new Set(nodes)).forEach((node) => {
+      node.removeAttribute(HIDDEN_TIMELINE_RECOMMENDATION_ATTR);
+      requestNativeVirtualItemRemeasure(node);
+    });
+  }
+
   function hideBlockedSearchResultCards(root = document) {
     if (
       !isWeiboSearchResultPage() ||
@@ -5376,6 +5486,10 @@
     );
   }
 
+  function stillLooksLikeTimelineRecommendation(node) {
+    return findTimelineRecommendationArticles(node).length > 0;
+  }
+
   function restoreRecycledVirtualAdShells(scope) {
     const nodes = [];
     if (scope instanceof Element && scope.matches(HIDDEN_AD_SELECTOR)) {
@@ -5397,6 +5511,29 @@
     });
   }
 
+  function restoreRecycledVirtualTimelineRecommendationShells(scope) {
+    const nodes = [];
+    if (
+      scope instanceof Element &&
+      scope.matches(HIDDEN_TIMELINE_RECOMMENDATION_SELECTOR)
+    ) {
+      nodes.push(scope);
+    }
+    scope
+      .querySelectorAll(HIDDEN_TIMELINE_RECOMMENDATION_SELECTOR)
+      .forEach((node) => nodes.push(node));
+
+    Array.from(new Set(nodes)).forEach((node) => {
+      if (!(node instanceof Element) || !node.closest(VIRTUAL_VIEW_SELECTOR)) {
+        return;
+      }
+      if (!stillLooksLikeTimelineRecommendation(node)) {
+        node.removeAttribute(HIDDEN_TIMELINE_RECOMMENDATION_ATTR);
+        requestNativeVirtualItemRemeasure(node);
+      }
+    });
+  }
+
   function restoreRecycledVirtualContentShells(root = document) {
     if (!root || !root.querySelectorAll) return;
     const scope =
@@ -5404,6 +5541,7 @@
         ? root.closest(VIRTUAL_VIEW_SELECTOR) || root
         : root;
     restoreRecycledVirtualAdShells(scope);
+    restoreRecycledVirtualTimelineRecommendationShells(scope);
     const nodes = [];
     if (
       scope instanceof Element &&
@@ -5442,6 +5580,9 @@
   function hideBlockedDOMPosts(root = document) {
     syncRelationshipPageMode();
     const hiddenAd = hideRecognizedAds(root || document);
+    const hiddenTimelineRecommendation = hideTimelineRecommendations(
+      root || document
+    );
     suppressFloatingVideoPlayers(root || document);
     if (!root || !root.querySelectorAll) return;
     if (isRelationshipListPage()) {
@@ -5459,7 +5600,10 @@
     }
     root.querySelectorAll(DOM_UID_SELECTOR).forEach((el) => nodes.push(el));
 
-    let hiddenAny = hiddenAd || hideBlockedSearchResultCards(root);
+    let hiddenAny =
+      hiddenAd ||
+      hiddenTimelineRecommendation ||
+      hideBlockedSearchResultCards(root);
     nodes.forEach((el) => {
       const blockedUID = [...extractDOMUIDs(el)].find((uid) => BL.has(uid));
       if (!blockedUID) return;
@@ -5571,7 +5715,7 @@
         isEligibleVirtualScrollerItem(target)) ||
       (isEligibleVirtualScrollerItem(target) &&
         !!target.closest(VIRTUAL_ITEM_SELECTOR)) ||
-      !!target.querySelector?.(BLOCKED_CONTENT_HIDE_SELECTOR)
+      !!target.querySelector?.(HIDDEN_FEED_CONTENT_SELECTOR)
     );
   }
 
@@ -5602,6 +5746,7 @@
         addedRoots.length > 0 && hasHiddenNonCommentContent(document);
       addedRoots.forEach((addedElement) => {
         hideRecognizedAds(addedElement);
+        hideTimelineRecommendations(addedElement);
         suppressFloatingVideoPlayers(addedElement);
         if (
           hasHiddenFeedContent ||
@@ -6742,6 +6887,7 @@
             <div class="wbset-onboard-options">
               <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>主页默认显示「最新微博」</strong><span>打开首页时优先进入按时间排序的全部关注时间线。</span></span><input type="checkbox" data-wbset-setting="defaultLatestTimeline"></label>
               <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>隐藏广告和推广微博</strong><span>过滤带广告、推广或赞助标识的内容。</span></span><input type="checkbox" data-wbset-setting="hideAds"></label>
+              <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>隐藏时间线推荐内容</strong><span>移除插入关注时间线的“你可能感兴趣的内容”。</span></span><input type="checkbox" data-wbset-setting="hideTimelineRecommendations"></label>
               <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>显示右下角设置按钮</strong><span>关闭后仍可从 Tampermonkey 菜单中的「设置」进入。</span></span><input type="checkbox" data-wbset-setting="showSettingsButton"></label>
               <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>屏蔽用户前确认</strong><span>通过右键菜单屏蔽时先显示确认对话框。</span></span><input type="checkbox" data-wbset-setting="confirmBeforeBlocking"></label>
             </div>
@@ -6778,6 +6924,7 @@
             <div class="wbset-onboard-summary">
               <div><span>最新微博时间线</span><strong>${draft.defaultLatestTimeline ? '开启' : '关闭'}</strong></div>
               <div><span>广告过滤</span><strong>${draft.hideAds ? '开启' : '关闭'}</strong></div>
+              <div><span>时间线推荐过滤</span><strong>${draft.hideTimelineRecommendations ? '开启' : '关闭'}</strong></div>
               <div><span>快捷设置按钮</span><strong>${draft.showSettingsButton ? '显示' : '隐藏'}</strong></div>
               <div><span>屏蔽前确认</span><strong>${draft.confirmBeforeBlocking ? '开启' : '关闭'}</strong></div>
               <div><span>屏蔽范围</span><strong>${enabledScopes} / 5 开启</strong></div>
@@ -6891,6 +7038,10 @@
                   <label class="wbset-setting">
                     <span class="wbset-setting-copy"><strong>隐藏广告和推广微博</strong><span>识别接口广告标记及页面中的广告、推广和赞助标识。</span></span>
                     <input type="checkbox" id="wbset-hide-ads">
+                  </label>
+                  <label class="wbset-setting">
+                    <span class="wbset-setting-copy"><strong>隐藏时间线推荐内容</strong><span>移除插入关注时间线的“你可能感兴趣的内容”。</span></span>
+                    <input type="checkbox" id="wbset-hide-timeline-recommendations">
                   </label>
                 </div>
                 <div class="wbset-sec">
@@ -7091,6 +7242,9 @@
         '#wbset-confirm-before-blocking'
       );
       const $hideAds = panel.querySelector('#wbset-hide-ads');
+      const $hideTimelineRecommendations = panel.querySelector(
+        '#wbset-hide-timeline-recommendations'
+      );
       const $showSettingsButton = panel.querySelector(
         '#wbset-show-settings-button'
       );
@@ -7133,6 +7287,8 @@
         $confirmBeforeBlocking.checked =
           CFG.confirmBeforeBlocking !== false;
         $hideAds.checked = CFG.hideAds !== false;
+        $hideTimelineRecommendations.checked =
+          CFG.hideTimelineRecommendations !== false;
         $showSettingsButton.checked = CFG.showSettingsButton !== false;
       }
       function refreshUIDManager(options = {}) {
@@ -7570,6 +7726,7 @@
         CFG.hideBlacklistInteractions = $blacklistInteractions.checked;
         CFG.confirmBeforeBlocking = $confirmBeforeBlocking.checked;
         CFG.hideAds = $hideAds.checked;
+        CFG.hideTimelineRecommendations = $hideTimelineRecommendations.checked;
         CFG.showSettingsButton = $showSettingsButton.checked;
         CFG = saveCfg(CFG);
         closePanel({ reset: false });
