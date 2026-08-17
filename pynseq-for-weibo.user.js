@@ -4,7 +4,7 @@
 // @name:zh-CN   Pynseq for Weibo｜屏序·微博
 // @name:en      Pynseq for Weibo｜屏序·微博
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
-// @version      2.3.5
+// @version      2.3.6
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
 // @description:en Restore a chronological Weibo timeline, locally block unwanted users, filter ads, simplify navigation, and manage official Weibo blocklist synchronization.
 // @author       DanielZenFlow
@@ -41,7 +41,7 @@
   const WB_INTERNAL = Object.create(null);
   const THROTTLE_MS = 350; // 新浪微博官方黑名单分页请求间隔（毫秒）
   const SCRIPT_NAME = 'Pynseq for Weibo｜屏序·微博';
-  const SCRIPT_VERSION = '2.3.5';
+  const SCRIPT_VERSION = '2.3.6';
   const GITHUB_URL = 'https://github.com/DanielZenFlow/Pynseq-Weibo';
   const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/danielzenflow';
   const ONBOARDING_DONE_KEY = 'pynseq_for_weibo_onboarding_done_v1';
@@ -1352,9 +1352,9 @@
     return m ? m[1] : '';
   }
 
-  function normalizeSyncCursor(value) {
-    const cursor = String(value ?? '').trim();
-    return !cursor || cursor === '0' ? '' : cursor;
+  function hasNextFilteredUsersPage(value) {
+    const flag = String(value ?? '').trim().toLowerCase();
+    return !['', '0', 'false', 'null', 'undefined'].includes(flag);
   }
 
   function parseFilteredUsersResponse(data, operationLabel) {
@@ -1375,21 +1375,19 @@
     if (
       data.next_cursor !== undefined &&
       data.next_cursor !== null &&
-      !['string', 'number'].includes(typeof data.next_cursor)
+      !['string', 'number', 'boolean'].includes(typeof data.next_cursor)
     ) {
       throw new Error(`新浪微博官方黑名单${label}响应游标无效`);
     }
     return {
       items: data.card_group,
-      nextCursor: normalizeSyncCursor(data.next_cursor),
+      hasNextPage:
+        hasNextFilteredUsersPage(data.next_cursor) && Number(data.total) !== 0,
     };
   }
 
-  function buildFilteredUsersURL(page, cursor) {
-    const cursorQuery = cursor
-      ? `&cursor=${encodeURIComponent(String(cursor))}`
-      : '';
-    return `/ajax/setting/getFilteredUsers?page=${page}${cursorQuery}`;
+  function buildFilteredUsersURL(page) {
+    return `/ajax/setting/getFilteredUsers?page=${page}`;
   }
 
   /**
@@ -1404,16 +1402,14 @@
     const baseExclusions = readLocalBLExclusions();
     const exclusions = new Set(baseExclusions);
     let page = 1,
-      cursor = '',
       strikes = 0;
-    const seenCursors = new Set();
     while (true) {
       throwIfSyncAborted(signal);
       if (page > MAX_FULL_SYNC_PAGES) {
         throw new Error('新浪微博官方黑名单页数异常，完整同步已停止');
       }
       onProgress?.({ currentPage: page, loaded: list.length });
-      const url = buildFilteredUsersURL(page, cursor);
+      const url = buildFilteredUsersURL(page);
       const res = await WB_BL_NATIVE.fetch(url, {
         credentials: 'include',
         signal,
@@ -1442,13 +1438,7 @@
         list.push(uid);
       });
       onProgress?.({ currentPage: page, loaded: list.length });
-      const nextCursor = parsed.nextCursor;
-      if (!nextCursor) break;
-      if (seenCursors.has(nextCursor)) {
-        throw new Error('新浪微博官方黑名单重复返回同一游标，完整同步已停止');
-      }
-      seenCursors.add(nextCursor);
-      cursor = nextCursor;
+      if (!parsed.hasNextPage || parsed.items.length === 0) break;
       page++;
       await sleep(THROTTLE_MS, signal);
     }
@@ -1524,13 +1514,11 @@
     }
     const { signal, onProgress } = options;
     let page = 1,
-      cursor = '',
       strikes = 0,
       added = 0;
     const workingSet = new Set(set);
     const baseExclusions = readLocalBLExclusions();
     const exclusions = new Set(baseExclusions);
-    const seenCursors = new Set();
     while (page <= pages) {
       throwIfSyncAborted(signal);
       onProgress?.({
@@ -1538,7 +1526,7 @@
         targetPages: pages,
         loaded: workingSet.size - set.size,
       });
-      const url = buildFilteredUsersURL(page, cursor);
+      const url = buildFilteredUsersURL(page);
       const res = await WB_BL_NATIVE.fetch(url, {
         credentials: 'include',
         signal,
@@ -1575,13 +1563,7 @@
         targetPages: pages,
         loaded: added,
       });
-      const nextCursor = parsed.nextCursor;
-      if (!nextCursor) break;
-      if (seenCursors.has(nextCursor)) {
-        throw new Error('新浪微博官方黑名单重复返回同一游标，分页同步已停止');
-      }
-      seenCursors.add(nextCursor);
-      cursor = nextCursor;
+      if (!parsed.hasNextPage || parsed.items.length === 0) break;
       page++;
       await sleep(THROTTLE_MS, signal);
     }
