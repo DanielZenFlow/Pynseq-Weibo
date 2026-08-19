@@ -59,10 +59,24 @@ node regression.test.cjs
 
 识别分两步：
 
-1. `observeContentResponse` 解析第一方微博域名下 `/ajax/feed/` 与 `/ajax/statuses/` 的响应副本，将带广告标记的微博 id 写入 `AD_POST_IDS`（上限 3000 条，按写入顺序淘汰）。
-2. `hideRecognizedAds` 从卡片正文链接 `/{uid}/{mblogid}` 取出条目标识，命中登记表即隐藏。
+1. `observeContentResponse` 解析第一方微博域名下 `/ajax/feed/` 与 `/ajax/statuses/` 的响应副本，将带广告标记的微博 id 与作者归类写入 `AD_POST_OWNERS`（上限 3000 条，按写入顺序淘汰）。
+2. `hideRecognizedAds` 从卡片正文链接 `/{uid}/{mblogid}` 取出条目标识，命中登记表且对应分档开启时隐藏。
 
 回包可能晚于卡片渲染到达，登记表新增条目时会触发一次补扫。
+
+### 作者归类
+
+`classifyAdPostOwner` 按作者与当前账号的关系把广告分为三档，分别对应 `hideAdsFromFollowing`、`hideAdsFromStrangers`、`hideAdsFromSelf` 三个设置项：
+
+| 分档 | 判定依据 | 默认 |
+| --- | --- | --- |
+| `self` | 作者 uid 等于当前登录 uid | 保留 |
+| `stranger` | `user.following === false` | 隐藏 |
+| `following` | 其余情况，含 `user.following` 缺失 | 隐藏 |
+
+当前登录 uid 取自页面全局 `$CONFIG`（`user.idstr` 或 `uid`），读取失败时返回空串，此时不会产生 `self` 分档。转发按外层微博的作者归类。`user.following` 缺失时归入 `following`，用户关闭该档时无法判定关系的条目保持显示。
+
+`hideAds` 是总开关，关闭时三档均不生效。三档的开关变更经 `applyRuntimeConfig` 走完整的恢复与重扫流程。
 
 ## 虚拟列表
 
