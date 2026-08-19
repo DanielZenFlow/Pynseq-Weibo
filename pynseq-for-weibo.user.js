@@ -6397,7 +6397,6 @@
     .wbset-setting{position:relative;display:flex;align-items:center;justify-content:space-between;gap:20px;padding:13px 15px;border-bottom:1px solid var(--wbset-border);cursor:pointer}
     .wbset-setting:last-child{border-bottom:0}.wbset-setting:hover{background:color-mix(in srgb,var(--wbset-sidebar) 58%,transparent)}
     .wbset-setting.is-sub{padding-left:38px}
-    .wbset-setting.is-sub::before{content:"";position:absolute;left:22px;top:0;bottom:0;width:2px;background:var(--wbset-border)}
     .wbset-setting.is-sub[data-disabled="1"]{opacity:.45;cursor:default}
     .wbset-setting-copy{min-width:0;display:grid;gap:3px}.wbset-setting-copy strong{font-size:13px;font-weight:560}.wbset-setting-copy span{font-size:12px;line-height:1.45;color:var(--wbset-muted)}
     .wbset-setting input[type="checkbox"]{position:absolute;opacity:0;pointer-events:none}
