@@ -4,7 +4,7 @@
 // @name:zh-CN   Pynseq for Weibo｜屏序·微博
 // @name:en      Pynseq for Weibo｜屏序·微博
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
-// @version      2.4.0
+// @version      2.4.1
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
 // @description:en Restore a chronological Weibo timeline, locally block unwanted users, filter ads, simplify navigation, and manage official Weibo blocklist synchronization.
 // @author       DanielZenFlow
@@ -41,7 +41,7 @@
   const WB_INTERNAL = Object.create(null);
   const THROTTLE_MS = 350; // 新浪微博官方黑名单分页请求间隔（毫秒）
   const SCRIPT_NAME = 'Pynseq for Weibo｜屏序·微博';
-  const SCRIPT_VERSION = '2.4.0';
+  const SCRIPT_VERSION = '2.4.1';
   const GITHUB_URL = 'https://github.com/DanielZenFlow/Pynseq-Weibo';
   const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/danielzenflow';
   const ONBOARDING_DONE_KEY = 'pynseq_for_weibo_onboarding_done_v1';
@@ -68,6 +68,9 @@
     hideBlacklistInteractions: true,
     confirmBeforeBlocking: true,
     hideAds: true,
+    hideAdsFromFollowing: true,
+    hideAdsFromStrangers: true,
+    hideAdsFromSelf: false,
     hideTimelineRecommendations: true,
     showSettingsButton: true,
   });
@@ -1033,6 +1036,9 @@
     hideBlacklistUserCards: true,
     hideBlacklistInteractions: true,
     hideAds: true,
+    hideAdsFromFollowing: true,
+    hideAdsFromStrangers: true,
+    hideAdsFromSelf: false,
     hideTimelineRecommendations: true,
   };
   const CONTENT_FILTER_CFG = (() => {
@@ -2133,42 +2139,87 @@
   // 未经删减的 statuses 与游标，任何对回包内容的改写都会让原生组件回退旧缓存并
   // 永久保持加载状态，所以隐藏动作一律放在 DOM 侧完成。
   const AD_POST_ID_LIMIT = 3000;
-  const AD_POST_IDS = new Set();
+  const AD_POST_OWNERS = new Map();
+  const AD_OWNER_SELF = 'self';
+  const AD_OWNER_FOLLOWING = 'following';
+  const AD_OWNER_STRANGER = 'stranger';
   const OBSERVED_RESPONSE_PATH_RE = /^\/ajax\/(?:feed|statuses)\//i;
   const AD_PAYLOAD_MAX_DEPTH = 12;
   const POST_PERMALINK_RE = /^\/(\d{4,})\/([A-Za-z0-9]{6,})(?:[/?#]|$)/;
 
-  function rememberAdPostID(id) {
+  // 当前登录用户 uid 用于区分「自己发布的广告」。微博把它写在页面全局 $CONFIG 上，
+  // 脚本只读取该值；读不到时按未知处理，条目落入关注或非关注两类。
+  let currentUserIDCache = '';
+  function getCurrentUserID() {
+    if (currentUserIDCache) return currentUserIDCache;
+    try {
+      const pageConfig = window.$CONFIG;
+      if (!pageConfig || typeof pageConfig !== 'object') return '';
+      const raw = pageConfig.user?.idstr ?? pageConfig.uid;
+      const id = String(raw ?? '').trim();
+      if (/^\d{4,}$/.test(id)) currentUserIDCache = id;
+    } catch {
+      /* 页面全局不可读时保持未知 */
+    }
+    return currentUserIDCache;
+  }
+
+  // 广告微博按作者与当前用户的关系分成三类，分别对应三个设置项。转发按外层微博的
+  // 作者归类。user.following 缺失时归入「关注博主」：用户关闭该档时，无法判定关系
+  // 的条目保持显示。
+  function classifyAdPostOwner(item) {
+    const user = item && typeof item === 'object' ? item.user : null;
+    const authorID = String(user?.idstr ?? user?.id ?? '').trim();
+    const selfID = getCurrentUserID();
+    if (selfID && authorID && authorID === selfID) return AD_OWNER_SELF;
+    if (user && user.following === false) return AD_OWNER_STRANGER;
+    return AD_OWNER_FOLLOWING;
+  }
+
+  function isHiddenAdOwner(owner) {
+    if (owner === AD_OWNER_SELF) {
+      return CONTENT_FILTER_CFG.hideAdsFromSelf === true;
+    }
+    if (owner === AD_OWNER_STRANGER) {
+      return CONTENT_FILTER_CFG.hideAdsFromStrangers !== false;
+    }
+    if (owner === AD_OWNER_FOLLOWING) {
+      return CONTENT_FILTER_CFG.hideAdsFromFollowing !== false;
+    }
+    return false;
+  }
+
+  function rememberAdPost(id, owner) {
     const key = String(id || '').trim();
     if (!key) return;
     // 时间线可以无限翻页，登记表必须自行淘汰最早的条目，避免长时间浏览后无界增长。
-    if (!AD_POST_IDS.has(key) && AD_POST_IDS.size >= AD_POST_ID_LIMIT) {
-      const oldest = AD_POST_IDS.values().next().value;
-      if (oldest !== undefined) AD_POST_IDS.delete(oldest);
+    if (!AD_POST_OWNERS.has(key) && AD_POST_OWNERS.size >= AD_POST_ID_LIMIT) {
+      const oldest = AD_POST_OWNERS.keys().next().value;
+      if (oldest !== undefined) AD_POST_OWNERS.delete(oldest);
     }
-    AD_POST_IDS.add(key);
+    AD_POST_OWNERS.set(key, owner);
   }
 
-  function isKnownAdPostID(id) {
+  function getAdPostOwner(id) {
     const key = String(id || '').trim();
-    return !!key && AD_POST_IDS.has(key);
+    return key ? AD_POST_OWNERS.get(key) || '' : '';
   }
 
-  function collectAdPostIDs(payload, depth = 0) {
+  function collectAdPosts(payload, depth = 0) {
     if (!payload || typeof payload !== 'object' || depth > AD_PAYLOAD_MAX_DEPTH) {
       return;
     }
     if (Array.isArray(payload)) {
-      payload.forEach((item) => collectAdPostIDs(item, depth + 1));
+      payload.forEach((item) => collectAdPosts(item, depth + 1));
       return;
     }
     const postID = payload.mblogid;
     if (postID && hasExplicitAdMarker(payload)) {
-      rememberAdPostID(postID);
+      rememberAdPost(postID, classifyAdPostOwner(payload));
     }
     Object.keys(payload).forEach((key) => {
       if (isUnsafeObjectKey(key)) return;
-      collectAdPostIDs(payload[key], depth + 1);
+      collectAdPosts(payload[key], depth + 1);
     });
   }
 
@@ -2183,15 +2234,15 @@
     } catch {
       return;
     }
-    const knownBefore = AD_POST_IDS.size;
+    const knownBefore = AD_POST_OWNERS.size;
     try {
-      collectAdPostIDs(payload);
+      collectAdPosts(payload);
     } catch {
       /* 观察层出错不得影响页面 */
     }
     // 回包可能晚于卡片渲染到达。登记表新增条目时补一次扫描，否则这批广告要等到
     // 下一次 DOM 变动才会被隐藏。
-    if (AD_POST_IDS.size !== knownBefore) {
+    if (AD_POST_OWNERS.size !== knownBefore) {
       queueBlockedDOMRefresh(document, 60);
     }
   }
@@ -4357,8 +4408,9 @@
   }
 
   function isRegisteredAdPostRoot(root) {
-    if (!(root instanceof Element) || !AD_POST_IDS.size) return false;
-    return isKnownAdPostID(extractPostIDFromRoot(root));
+    if (!(root instanceof Element) || !AD_POST_OWNERS.size) return false;
+    const owner = getAdPostOwner(extractPostIDFromRoot(root));
+    return !!owner && isHiddenAdOwner(owner);
   }
 
   function hideRecognizedAds(root = document) {
@@ -6344,6 +6396,9 @@
     .wbset-sec-title{padding:13px 15px 10px;font-size:13px;font-weight:650;border-bottom:1px solid var(--wbset-border)}
     .wbset-setting{position:relative;display:flex;align-items:center;justify-content:space-between;gap:20px;padding:13px 15px;border-bottom:1px solid var(--wbset-border);cursor:pointer}
     .wbset-setting:last-child{border-bottom:0}.wbset-setting:hover{background:color-mix(in srgb,var(--wbset-sidebar) 58%,transparent)}
+    .wbset-setting.is-sub{padding-left:38px}
+    .wbset-setting.is-sub::before{content:"";position:absolute;left:22px;top:0;bottom:0;width:2px;background:var(--wbset-border)}
+    .wbset-setting.is-sub[data-disabled="1"]{opacity:.45;cursor:default}
     .wbset-setting-copy{min-width:0;display:grid;gap:3px}.wbset-setting-copy strong{font-size:13px;font-weight:560}.wbset-setting-copy span{font-size:12px;line-height:1.45;color:var(--wbset-muted)}
     .wbset-setting input[type="checkbox"]{position:absolute;opacity:0;pointer-events:none}
     .wbset-row{display:flex;align-items:center;flex-wrap:wrap;gap:9px;padding:12px 15px}.wbset-row + .wbset-row{padding-top:0}
@@ -6781,7 +6836,7 @@
             <p>右键屏蔽始终可用；时间线、isAd 广告过滤、设置按钮与操作确认可以分别启用。</p>
             <div class="wbset-onboard-options">
               <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>主页默认显示「最新微博」</strong><span>打开首页时优先进入按时间排序的全部关注时间线。</span></span><input type="checkbox" data-wbset-setting="defaultLatestTimeline"></label>
-              <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>屏蔽 isAd 相关标签广告</strong><span>依据微博接口下发的 isAd 广告标记隐藏微博，包含关注博主发布的商业推广。</span></span><input type="checkbox" data-wbset-setting="hideAds"></label>
+              <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>屏蔽 isAd 相关标签广告</strong><span>依据微博接口下发的 isAd 广告标记隐藏微博。默认隐藏关注博主与非关注博主发布的广告，本人发布的广告默认保留，可在设置中分别调整。</span></span><input type="checkbox" data-wbset-setting="hideAds"></label>
               <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>隐藏时间线推荐内容</strong><span>移除插入关注时间线的“你可能感兴趣的内容”。</span></span><input type="checkbox" data-wbset-setting="hideTimelineRecommendations"></label>
               <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>显示右下角设置按钮</strong><span>关闭后仍可从 Tampermonkey 菜单中的「设置」进入。</span></span><input type="checkbox" data-wbset-setting="showSettingsButton"></label>
               <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>屏蔽用户前确认</strong><span>通过右键菜单屏蔽时先显示确认对话框。</span></span><input type="checkbox" data-wbset-setting="confirmBeforeBlocking"></label>
@@ -6931,8 +6986,20 @@
                     <input type="checkbox" id="wbset-search-related-users">
                   </label>
                   <label class="wbset-setting">
-                    <span class="wbset-setting-copy"><strong>屏蔽 isAd 相关标签广告</strong><span>依据微博接口下发的 isAd 广告标记隐藏对应微博。关注博主发布的商业推广同样带有该标记，开启后会一并隐藏。</span></span>
+                    <span class="wbset-setting-copy"><strong>屏蔽 isAd 相关标签广告</strong><span>依据微博接口下发的 isAd 广告标记隐藏对应微博。总开关关闭时，下方三项均不生效。</span></span>
                     <input type="checkbox" id="wbset-hide-ads">
+                  </label>
+                  <label class="wbset-setting is-sub" id="wbset-hide-ads-following-row">
+                    <span class="wbset-setting-copy"><strong>关注博主发布的广告</strong><span>已关注博主发布的商业推广，例如节目宣传、品牌活动、转发抽奖。</span></span>
+                    <input type="checkbox" id="wbset-hide-ads-following">
+                  </label>
+                  <label class="wbset-setting is-sub" id="wbset-hide-ads-strangers-row">
+                    <span class="wbset-setting-copy"><strong>非关注博主发布的广告</strong><span>微博插入时间线的推广内容，作者不在关注列表内。</span></span>
+                    <input type="checkbox" id="wbset-hide-ads-strangers">
+                  </label>
+                  <label class="wbset-setting is-sub" id="wbset-hide-ads-self-row">
+                    <span class="wbset-setting-copy"><strong>本人发布的广告</strong><span>当前账号自己发布并带有 isAd 标记的微博，例如使用粉丝头条推广的内容。默认不隐藏。</span></span>
+                    <input type="checkbox" id="wbset-hide-ads-self">
                   </label>
                   <label class="wbset-setting">
                     <span class="wbset-setting-copy"><strong>隐藏时间线推荐内容</strong><span>移除插入关注时间线的“你可能感兴趣的内容”。</span></span>
@@ -7137,6 +7204,30 @@
         '#wbset-confirm-before-blocking'
       );
       const $hideAds = panel.querySelector('#wbset-hide-ads');
+      const $hideAdsFromFollowing = panel.querySelector(
+        '#wbset-hide-ads-following'
+      );
+      const $hideAdsFromStrangers = panel.querySelector(
+        '#wbset-hide-ads-strangers'
+      );
+      const $hideAdsFromSelf = panel.querySelector('#wbset-hide-ads-self');
+      const adScopeRows = [
+        '#wbset-hide-ads-following-row',
+        '#wbset-hide-ads-strangers-row',
+        '#wbset-hide-ads-self-row',
+      ].map((selector) => panel.querySelector(selector));
+      // 三个分档只在总开关打开时可用，关闭时置灰并停止响应点击。
+      const syncAdScopeAvailability = () => {
+        const enabled = !!$hideAds && $hideAds.checked;
+        [$hideAdsFromFollowing, $hideAdsFromStrangers, $hideAdsFromSelf].forEach(
+          (input) => {
+            if (input) input.disabled = !enabled;
+          }
+        );
+        adScopeRows.forEach((row) => {
+          if (row) row.setAttribute('data-disabled', enabled ? '0' : '1');
+        });
+      };
       const $hideTimelineRecommendations = panel.querySelector(
         '#wbset-hide-timeline-recommendations'
       );
@@ -7182,6 +7273,16 @@
         $confirmBeforeBlocking.checked =
           CFG.confirmBeforeBlocking !== false;
         $hideAds.checked = CFG.hideAds !== false;
+        if ($hideAdsFromFollowing) {
+          $hideAdsFromFollowing.checked = CFG.hideAdsFromFollowing !== false;
+        }
+        if ($hideAdsFromStrangers) {
+          $hideAdsFromStrangers.checked = CFG.hideAdsFromStrangers !== false;
+        }
+        if ($hideAdsFromSelf) {
+          $hideAdsFromSelf.checked = CFG.hideAdsFromSelf === true;
+        }
+        syncAdScopeAvailability();
         $hideTimelineRecommendations.checked =
           CFG.hideTimelineRecommendations !== false;
         $showSettingsButton.checked = CFG.showSettingsButton !== false;
@@ -7621,6 +7722,15 @@
         CFG.hideBlacklistInteractions = $blacklistInteractions.checked;
         CFG.confirmBeforeBlocking = $confirmBeforeBlocking.checked;
         CFG.hideAds = $hideAds.checked;
+        if ($hideAdsFromFollowing) {
+          CFG.hideAdsFromFollowing = $hideAdsFromFollowing.checked;
+        }
+        if ($hideAdsFromStrangers) {
+          CFG.hideAdsFromStrangers = $hideAdsFromStrangers.checked;
+        }
+        if ($hideAdsFromSelf) {
+          CFG.hideAdsFromSelf = $hideAdsFromSelf.checked;
+        }
         CFG.hideTimelineRecommendations = $hideTimelineRecommendations.checked;
         CFG.showSettingsButton = $showSettingsButton.checked;
         CFG = saveCfg(CFG);
@@ -7658,6 +7768,9 @@
           closePanel();
         }
       });
+      if ($hideAds) {
+        $hideAds.addEventListener('change', syncAdScopeAvailability);
+      }
       panel.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') closePanel();
       });

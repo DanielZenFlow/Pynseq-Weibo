@@ -43,7 +43,7 @@ assert.match(
   sourceBetween('    const handleContextMenu = (e) => {', "    document.addEventListener('contextmenu'"),
   /if \(!isTrustedUserEvent\(e\)\) return;/
 );
-assert.match(source, /function\s+collectAdPostIDs\s*\(/);
+assert.match(source, /function\s+collectAdPosts\s*\(/);
 assert.match(source, /function\s+runControlledSync\s*\(/);
 assert.match(source, /controller\.abort\(\)/);
 assert.match(source, /USER_SCRIPT_UI_SELECTOR/);
@@ -667,8 +667,8 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+2\.4\.0/);
-assert.match(source, /const SCRIPT_VERSION = '2\.4\.0'/);
+assert.match(source, /@version\s+2\.4\.1/);
+assert.match(source, /const SCRIPT_VERSION = '2\.4\.1'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
@@ -2700,10 +2700,16 @@ const adRuntime = {
   refreshCalls: 0,
 };
 const adContext = vm.createContext({
-  CONTENT_FILTER_CFG: { hideAds: true },
+  CONTENT_FILTER_CFG: {
+    hideAds: true,
+    hideAdsFromFollowing: true,
+    hideAdsFromStrangers: true,
+    hideAdsFromSelf: false,
+  },
   URL,
   console,
   document: {},
+  window: { $CONFIG: { user: { idstr: '1635218563' } } },
   location: { origin: 'https://weibo.com' },
   queueBlockedDOMRefresh: () => {
     adRuntime.refreshCalls += 1;
@@ -2720,11 +2726,14 @@ vm.runInContext(
   )}
   globalThis.adAPI = {
     hasExplicitAdMarker,
-    rememberAdPostID,
-    isKnownAdPostID,
-    collectAdPostIDs,
+    rememberAdPost,
+    getAdPostOwner,
+    collectAdPosts,
+    classifyAdPostOwner,
+    isHiddenAdOwner,
+    getCurrentUserID,
     observeContentResponse,
-    AD_POST_IDS,
+    AD_POST_OWNERS,
     AD_POST_ID_LIMIT,
   };`,
   adContext
@@ -2744,8 +2753,8 @@ assert.equal(adAPI.hasExplicitAdMarker({ mark: 'benchmark_adjacent' }), false);
 assert.equal(adAPI.hasExplicitAdMarker({}), false);
 
 // 回包解析只登记带广告标记的条目，转发内层与外层分别判定。
-adAPI.AD_POST_IDS.clear();
-adAPI.collectAdPostIDs({
+adAPI.AD_POST_OWNERS.clear();
+adAPI.collectAdPosts({
   statuses: [
     { mblogid: 'AdOne11', isAd: true },
     { mblogid: 'Normal11' },
@@ -2756,23 +2765,81 @@ adAPI.collectAdPostIDs({
     },
   ],
 });
-assert.equal(adAPI.isKnownAdPostID('AdOne11'), true);
-assert.equal(adAPI.isKnownAdPostID('AdTwo22'), true);
-assert.equal(adAPI.isKnownAdPostID('InnerAd4'), true);
-assert.equal(adAPI.isKnownAdPostID('Normal11'), false);
-assert.equal(adAPI.isKnownAdPostID('Outer33'), false);
-assert.equal(adAPI.isKnownAdPostID(''), false);
+assert.equal(!!adAPI.getAdPostOwner('AdOne11'), true);
+assert.equal(!!adAPI.getAdPostOwner('AdTwo22'), true);
+assert.equal(!!adAPI.getAdPostOwner('InnerAd4'), true);
+assert.equal(!!adAPI.getAdPostOwner('Normal11'), false);
+assert.equal(!!adAPI.getAdPostOwner('Outer33'), false);
+assert.equal(!!adAPI.getAdPostOwner(''), false);
+
+// 广告按作者与当前账号的关系分为本人、关注、非关注三档。
+assert.equal(adAPI.getCurrentUserID(), '1635218563');
+assert.equal(
+  adAPI.classifyAdPostOwner({ user: { idstr: '1635218563', following: false } }),
+  'self'
+);
+assert.equal(
+  adAPI.classifyAdPostOwner({ user: { idstr: '99999999', following: true } }),
+  'following'
+);
+assert.equal(
+  adAPI.classifyAdPostOwner({ user: { idstr: '99999999', following: false } }),
+  'stranger'
+);
+// following 字段缺失时归入关注档，关闭该档时无法判定关系的条目保持显示。
+assert.equal(
+  adAPI.classifyAdPostOwner({ user: { idstr: '99999999' } }),
+  'following'
+);
+assert.equal(adAPI.classifyAdPostOwner({}), 'following');
+
+// 三个分档开关分别控制对应归类是否隐藏。
+adContext.CONTENT_FILTER_CFG.hideAdsFromFollowing = true;
+adContext.CONTENT_FILTER_CFG.hideAdsFromStrangers = true;
+adContext.CONTENT_FILTER_CFG.hideAdsFromSelf = false;
+assert.equal(adAPI.isHiddenAdOwner('following'), true);
+assert.equal(adAPI.isHiddenAdOwner('stranger'), true);
+assert.equal(adAPI.isHiddenAdOwner('self'), false);
+assert.equal(adAPI.isHiddenAdOwner(''), false);
+adContext.CONTENT_FILTER_CFG.hideAdsFromFollowing = false;
+adContext.CONTENT_FILTER_CFG.hideAdsFromSelf = true;
+assert.equal(adAPI.isHiddenAdOwner('following'), false);
+assert.equal(adAPI.isHiddenAdOwner('stranger'), true);
+assert.equal(adAPI.isHiddenAdOwner('self'), true);
+adContext.CONTENT_FILTER_CFG.hideAdsFromFollowing = true;
+adContext.CONTENT_FILTER_CFG.hideAdsFromSelf = false;
+
+// 回包解析在登记 id 的同时记录作者归类。
+adAPI.AD_POST_OWNERS.clear();
+adAPI.collectAdPosts({
+  statuses: [
+    { mblogid: 'SelfAd01', isAd: true, user: { idstr: '1635218563' } },
+    {
+      mblogid: 'FollowAd',
+      isAd: true,
+      user: { idstr: '2222222222', following: true },
+    },
+    {
+      mblogid: 'StrangeA',
+      isAd: true,
+      user: { idstr: '3333333333', following: false },
+    },
+  ],
+});
+assert.equal(adAPI.getAdPostOwner('SelfAd01'), 'self');
+assert.equal(adAPI.getAdPostOwner('FollowAd'), 'following');
+assert.equal(adAPI.getAdPostOwner('StrangeA'), 'stranger');
 
 // 时间线可无限翻页，登记表必须有界并淘汰最早写入的条目。
-adAPI.AD_POST_IDS.clear();
+adAPI.AD_POST_OWNERS.clear();
 for (let i = 0; i < adAPI.AD_POST_ID_LIMIT + 5; i += 1) {
-  adAPI.rememberAdPostID(`id${i}`);
+  adAPI.rememberAdPost(`id${i}`, 'following');
 }
-assert.equal(adAPI.AD_POST_IDS.size, adAPI.AD_POST_ID_LIMIT);
-assert.equal(adAPI.isKnownAdPostID('id0'), false);
-assert.equal(adAPI.isKnownAdPostID('id4'), false);
+assert.equal(adAPI.AD_POST_OWNERS.size, adAPI.AD_POST_ID_LIMIT);
+assert.equal(!!adAPI.getAdPostOwner('id0'), false);
+assert.equal(!!adAPI.getAdPostOwner('id4'), false);
 assert.equal(
-  adAPI.isKnownAdPostID(`id${adAPI.AD_POST_ID_LIMIT + 4}`),
+  !!adAPI.getAdPostOwner(`id${adAPI.AD_POST_ID_LIMIT + 4}`),
   true
 );
 
@@ -2790,17 +2857,17 @@ const adPayload = JSON.stringify({
   ['https://example.com/ajax/feed/friendstimeline', false],
   ['https://weibo.com/anything?next=/ajax/feed/friendstimeline', false],
 ].forEach(([url, shouldRegister]) => {
-  adAPI.AD_POST_IDS.clear();
+  adAPI.AD_POST_OWNERS.clear();
   adAPI.observeContentResponse(url, adPayload);
   assert.equal(
-    adAPI.isKnownAdPostID('ScopeAd1'),
+    !!adAPI.getAdPostOwner('ScopeAd1'),
     shouldRegister,
     `${url} 的观察范围判定不符合预期`
   );
 });
 
 // 回包可能晚于卡片渲染到达，登记表新增条目时必须补一次 DOM 扫描。
-adAPI.AD_POST_IDS.clear();
+adAPI.AD_POST_OWNERS.clear();
 adRuntime.refreshCalls = 0;
 adAPI.observeContentResponse(
   'https://weibo.com/ajax/feed/friendstimeline',
@@ -2815,7 +2882,7 @@ adAPI.observeContentResponse(
 assert.equal(adRuntime.refreshCalls, 1);
 
 // 非 JSON 响应与关闭开关时不做任何处理。
-adAPI.AD_POST_IDS.clear();
+adAPI.AD_POST_OWNERS.clear();
 adRuntime.refreshCalls = 0;
 adAPI.observeContentResponse(
   'https://weibo.com/ajax/feed/friendstimeline',
@@ -2827,7 +2894,7 @@ adAPI.observeContentResponse(
   'https://weibo.com/ajax/feed/friendstimeline',
   adPayload
 );
-assert.equal(adAPI.isKnownAdPostID('ScopeAd1'), false);
+assert.equal(!!adAPI.getAdPostOwner('ScopeAd1'), false);
 adContext.CONTENT_FILTER_CFG.hideAds = true;
 
 // 卡片上的条目标识取自正文链接 /{uid}/{mblogid}，头像等用户链接不得命中。
@@ -2842,17 +2909,23 @@ class FakeAdPostElement {
 }
 const permalinkContext = vm.createContext({
   Element: FakeAdPostElement,
+  CONTENT_FILTER_CFG: {
+    hideAdsFromFollowing: true,
+    hideAdsFromStrangers: true,
+    hideAdsFromSelf: false,
+  },
+  window: {},
 });
 vm.runInContext(
   `${sourceBetween(
     '  const AD_POST_ID_LIMIT = 3000;',
-    '  function collectAdPostIDs('
+    '  function collectAdPosts('
   )}
   ${sourceBetween(
     '  // 微博卡片内的正文链接形如 /{uid}/{mblogid}',
     '  function hideRecognizedAds(root = document) {'
   )}
-  rememberAdPostID('Perma123');
+  rememberAdPost('Perma123', 'stranger');
   globalThis.permalinkAPI = { extractPostIDFromRoot, isRegisteredAdPostRoot };`,
   permalinkContext
 );
