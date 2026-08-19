@@ -2196,8 +2196,8 @@
     }
   }
 
-  // 仅在页面允许的情况下安装观察层。包装体把原生返回值原样交还调用方，读取一律
-  // 走响应副本，避免消耗页面自己要读的响应体。
+  // 安装观察层。包装体把原生返回值原样交还调用方，读取一律走响应副本，避免消耗
+  // 页面自身要读取的响应体。
   (function installContentResponseObserver() {
     const nativeFetch = window.fetch;
     if (typeof nativeFetch === 'function') {
@@ -5398,9 +5398,9 @@
       // 的正常微博会继续沿用上一条广告的隐藏状态。
       if (!stillLooksLikeRecognizedAd(node)) {
         node.removeAttribute(HIDDEN_AD_ATTR);
-        // 摘掉标记只是让壳恢复原始高度，DynamicScroller 仍然记着隐藏期间那个
-        // 2px 的测量值。不补一次重测，复用后的正常微博就会挤在一条缝里，后面
-        // 的行也跟着错位——和黑名单、推荐内容两条恢复路径保持一致。
+        // 移除标记只恢复壳的原始高度，DynamicScroller 仍缓存隐藏期间的 2px 测量
+        // 值。不补发重测时，复用后的正常微博会被压缩显示，后续行坐标随之错位。
+        // 黑名单与推荐内容两条恢复路径同样在此处补发重测。
         requestNativeVirtualItemRemeasure(node);
       }
     });

@@ -2611,30 +2611,29 @@ assert.match(source, /const PANEL_HIDDEN_ATTR = 'data-__wb_hidden_by_userscript'
 //     assert.doesNotMatch(source, /XMLHttpRequest\.prototype\.(?:open|send|abort)\s*=/);
 //     assert.doesNotMatch(source, /window\.WebSocket\s*=/);
 //
-// 背景：脚本曾在接口层把广告和黑名单条目从 statuses 数组中删除后再交给页面，
-// 导致「全部关注」等主页时间线永久显示加载动画。修复方式是删除整个网络拦截层，
-// 并以上述四条断言禁止其恢复。
+// 引入背景：脚本曾在接口层把广告和黑名单条目从 statuses 数组中删除后再交给
+// 页面，导致「全部关注」等主页时间线持续显示加载动画。当时的处理是删除整个
+// 网络拦截层，并以上述四条断言禁止其恢复。
 //
-// 作废原因：
+// 替换原因：
 //
-// 1. 约束对象有误。故障成因是改写回包内容——分页器需要未经删减的 statuses 与
-//    游标，整页被过滤为空后原生组件会回退旧缓存并保持加载状态。该规矩禁止的
-//    却是安装钩子这一机制本身。
+// 1. 约束范围与故障成因不一致。该故障由改写回包内容引起：分页器需要未经删减的
+//    statuses 与游标，整页被过滤为空后原生组件回退旧缓存并保持加载状态。上述
+//    断言约束的是安装钩子这一机制。
 //
-// 2. 掺入未经验证的成因。变更日志记录为「破坏微博新版 Axios 对原生对象身份与
-//    生命周期的依赖」。实测数据：只克隆响应、不改写返回内容的 fetch/XHR 观察层，
-//    在「全部关注」与「最新微博」上连续接收 10 次时间线回包、覆盖 62 条微博、
-//    连续四轮滚动，分页全程正常，未出现加载停滞。该成因未被观测数据支持。
+// 2. 「破坏微博新版 Axios 对原生对象身份与生命周期的依赖」这一成因缺少对应的
+//    观测记录。只克隆响应、不改写返回内容的 fetch/XHR 观察层在「全部关注」与
+//    「最新微博」上接收 10 次时间线回包、覆盖 62 条微博、四轮连续滚动期间，
+//    分页持续产出新内容。
 //
-// 3. 约束不完整。`window["fetch"] = ...`、`Object.defineProperty(window,
-//    'fetch', ...)`、`const w = window; w.fetch = ...` 均可绕过该断言。它约束的
-//    是一种书写形式，而非不变量。
+// 3. 断言可被等价写法绕过：`window["fetch"] = ...`、`Object.defineProperty(
+//    window, 'fetch', ...)`、`const w = window; w.fetch = ...` 均不匹配。其约束
+//    的是一种书写形式。
 //
-// 4. 未处理被禁能力留下的空壳。禁用调用方后，filterContentTree、
-//    transformContentResponseData、isFilterableContentURL 等函数连同其单元测试
-//    一并保留在仓库中，运行时无任何调用点。测试通过状态与实际能力不符：实测
-//    首页时间线中约 14% 的微博带有接口下发的 isAd 标记，脚本未隐藏其中任何一条。
-//    该层代码已在 2.4.0 删除。
+// 4. 被禁用能力的调用点移除后，filterContentTree、transformContentResponseData、
+//    isFilterableContentURL 等函数连同单元测试保留在仓库中，运行时无调用点。
+//    该状态下首页时间线中约 14% 的微博带有接口下发的 isAd 标记，均未被隐藏。
+//    这部分代码已在 2.4.0 删除。
 //
 // ═══ 网络层规矩 v2 —— 现行 ═══════════════════════════════════════════════
 //
@@ -2643,9 +2642,9 @@ assert.match(source, /const PANEL_HIDDEN_ATTR = 'data-__wb_hidden_by_userscript'
 // 允许只读观察，即克隆响应副本自行解析，用于识别广告与推荐内容。以下每条断言
 // 对应一种已知的故障形式。
 //
-// 适用范围：源码正则只能拦截显式写出的形式，无法覆盖等价改写。发布前的验收
-// 标准为：在「全部关注」与「最新微博」各连续翻页十次，分页持续产出新内容且不
-// 出现加载停滞。
+// 覆盖范围：源码正则只匹配显式写出的形式，不覆盖等价改写。涉及网络层的改动，
+// 发布前需在「全部关注」与「最新微博」各连续翻页十次，确认分页持续产出新内容
+// 且不出现加载停滞。
 
 // 故障形式一：将自行构造的响应交回页面。
 assert.doesNotMatch(
@@ -2717,7 +2716,7 @@ vm.runInContext(
   )}
   ${sourceBetween(
     '  function hasExplicitAdMarker(obj) {',
-    '  // 仅在页面允许的情况下安装观察层。'
+    '  (function installContentResponseObserver() {'
   )}
   globalThis.adAPI = {
     hasExplicitAdMarker,
