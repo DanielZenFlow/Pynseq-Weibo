@@ -4,7 +4,7 @@
 // @name:zh-CN   Pynseq for Weibo｜屏序·微博
 // @name:en      Pynseq for Weibo｜屏序·微博
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
-// @version      2.4.1
+// @version      2.4.2
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
 // @description:en Restore a chronological Weibo timeline, locally block unwanted users, filter ads, simplify navigation, and manage official Weibo blocklist synchronization.
 // @author       DanielZenFlow
@@ -41,7 +41,7 @@
   const WB_INTERNAL = Object.create(null);
   const THROTTLE_MS = 350; // 新浪微博官方黑名单分页请求间隔（毫秒）
   const SCRIPT_NAME = 'Pynseq for Weibo｜屏序·微博';
-  const SCRIPT_VERSION = '2.4.1';
+  const SCRIPT_VERSION = '2.4.2';
   const GITHUB_URL = 'https://github.com/DanielZenFlow/Pynseq-Weibo';
   const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/danielzenflow';
   const ONBOARDING_DONE_KEY = 'pynseq_for_weibo_onboarding_done_v1';
@@ -6397,7 +6397,6 @@
     .wbset-setting{position:relative;display:flex;align-items:center;justify-content:space-between;gap:20px;padding:13px 15px;border-bottom:1px solid var(--wbset-border);cursor:pointer}
     .wbset-setting:last-child{border-bottom:0}.wbset-setting:hover{background:color-mix(in srgb,var(--wbset-sidebar) 58%,transparent)}
     .wbset-setting.is-sub{padding-left:38px}
-    .wbset-setting.is-sub::before{content:"";position:absolute;left:22px;top:0;bottom:0;width:2px;background:var(--wbset-border)}
     .wbset-setting.is-sub[data-disabled="1"]{opacity:.45;cursor:default}
     .wbset-setting-copy{min-width:0;display:grid;gap:3px}.wbset-setting-copy strong{font-size:13px;font-weight:560}.wbset-setting-copy span{font-size:12px;line-height:1.45;color:var(--wbset-muted)}
     .wbset-setting input[type="checkbox"]{position:absolute;opacity:0;pointer-events:none}
