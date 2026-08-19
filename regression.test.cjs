@@ -43,7 +43,7 @@ assert.match(
   sourceBetween('    const handleContextMenu = (e) => {', "    document.addEventListener('contextmenu'"),
   /if \(!isTrustedUserEvent\(e\)\) return;/
 );
-assert.match(source, /function\s+filterContentTree\s*\(/);
+assert.match(source, /function\s+collectAdPostIDs\s*\(/);
 assert.match(source, /function\s+runControlledSync\s*\(/);
 assert.match(source, /controller\.abort\(\)/);
 assert.match(source, /USER_SCRIPT_UI_SELECTOR/);
@@ -667,8 +667,8 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+2\.3\.6/);
-assert.match(source, /const SCRIPT_VERSION = '2\.3\.6'/);
+assert.match(source, /@version\s+2\.4\.0/);
+assert.match(source, /const SCRIPT_VERSION = '2\.4\.0'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
@@ -2251,6 +2251,12 @@ assert.match(
   recycledAdSource,
   /if \(!stillLooksLikeRecognizedAd\(node\)\)[\s\S]*?node\.removeAttribute\(HIDDEN_AD_ATTR\)/
 );
+// 摘掉广告标记后必须补一次重测，否则 DynamicScroller 会继续沿用隐藏期间的
+// 2px 行高，复用回来的正常微博被压成一条缝。
+assert.match(
+  recycledAdSource,
+  /node\.removeAttribute\(HIDDEN_AD_ATTR\)[\s\S]*?requestNativeVirtualItemRemeasure\(node\)/
+);
 assert.match(
   sourceBetween(
     '  function restoreRecycledVirtualContentShells(',
@@ -2597,145 +2603,315 @@ assert.doesNotMatch(hotBandSource, /target\.remove\s*\(/);
 assert.match(hotBandSource, /markPanelHidden\((?:side|target)\)/);
 assert.match(source, /const PANEL_HIDDEN_ATTR = 'data-__wb_hidden_by_userscript'/);
 
-const context = vm.createContext({
-  AbortController,
-  BL: new Set(['12345']),
-  CONTENT_FILTER_CFG: {
-    hideAds: true,
-    hideBlacklistPosts: true,
-    hideBlacklistComments: true,
-    hideBlacklistSearchResults: true,
-    hideBlacklistUserCards: true,
-    hideBlacklistInteractions: true,
-  },
-  Headers,
-  Response,
-  URL,
-  console,
-  isRelationshipListPage: () => false,
-  isWeiboSearchResultPage: () => false,
-  location: {
-    origin: 'https://weibo.com',
-  },
-});
+// ═══ 网络层规矩 v1 —— 已作废，保留作为记录，后续代码不要参考 ═══════════════
+//
+// 原文四条断言：
+//     assert.doesNotMatch(source, /ENABLE_PAGE_NETWORK_INTERCEPTION/);
+//     assert.doesNotMatch(source, /window\.fetch\s*=/);
+//     assert.doesNotMatch(source, /XMLHttpRequest\.prototype\.(?:open|send|abort)\s*=/);
+//     assert.doesNotMatch(source, /window\.WebSocket\s*=/);
+//
+// 引入背景：脚本曾在接口层把广告和黑名单条目从 statuses 数组中删除后再交给
+// 页面，导致「全部关注」等主页时间线持续显示加载动画。当时的处理是删除整个
+// 网络拦截层，并以上述四条断言禁止其恢复。
+//
+// 替换原因：
+//
+// 1. 约束范围与故障成因不一致。该故障由改写回包内容引起：分页器需要未经删减的
+//    statuses 与游标，整页被过滤为空后原生组件回退旧缓存并保持加载状态。上述
+//    断言约束的是安装钩子这一机制。
+//
+// 2. 「破坏微博新版 Axios 对原生对象身份与生命周期的依赖」这一成因缺少对应的
+//    观测记录。只克隆响应、不改写返回内容的 fetch/XHR 观察层在「全部关注」与
+//    「最新微博」上接收 10 次时间线回包、覆盖 62 条微博、四轮连续滚动期间，
+//    分页持续产出新内容。
+//
+// 3. 断言可被等价写法绕过：`window["fetch"] = ...`、`Object.defineProperty(
+//    window, 'fetch', ...)`、`const w = window; w.fetch = ...` 均不匹配。其约束
+//    的是一种书写形式。
+//
+// 4. 被禁用能力的调用点移除后，filterContentTree、transformContentResponseData、
+//    isFilterableContentURL 等函数连同单元测试保留在仓库中，运行时无调用点。
+//    该状态下首页时间线中约 14% 的微博带有接口下发的 isAd 标记，均未被隐藏。
+//    这部分代码已在 2.4.0 删除。
+//
+// ═══ 网络层规矩 v2 —— 现行 ═══════════════════════════════════════════════
+//
+// 不变量：脚本可以读取网络响应，不得改变页面收到的内容与请求生命周期。
+//
+// 允许只读观察，即克隆响应副本自行解析，用于识别广告与推荐内容。以下每条断言
+// 对应一种已知的故障形式。
+//
+// 覆盖范围：源码正则只匹配显式写出的形式，不覆盖等价改写。涉及网络层的改动，
+// 发布前需在「全部关注」与「最新微博」各连续翻页十次，确认分页持续产出新内容
+// 且不出现加载停滞。
 
-vm.runInContext(
-  `${sourceBetween(
-    '  function isUnsafeObjectKey(key) {',
-    '  function normalizeStoredConfig(rawCfg) {'
-  )}
-  ${sourceBetween(
-    '  const MAX_FILTER_DEPTH = 80;',
-    '  const DOM_UID_SELECTOR = ['
-  )}`,
-  context
-);
-vm.runInContext(
-  `globalThis.testAPI = {
-    isFilterableContentURL,
-    transformContentResponseData,
-  };`,
-  context
-);
-
-const { testAPI } = context;
-const fixture = {
-  statuses: [
-    { id: 'blocked-post', user: { idstr: '12345', screen_name: 'blocked' } },
-    { id: 'ad-post', is_ad: true, user: { idstr: '67890' } },
-    { id: 'visible-post', user: { idstr: '67890', screen_name: 'visible' } },
-  ],
-  comments: [
-    { id: 'blocked-comment', user: { idstr: '12345', screen_name: 'blocked' } },
-    { id: 'visible-comment', user: { idstr: '67890', screen_name: 'visible' } },
-  ],
-};
-const filtered = testAPI.transformContentResponseData(
-  fixture,
-  'https://weibo.com/ajax/statuses/mymblog'
-);
-assert.equal(filtered.changed, true);
-assert.deepEqual(
-  Array.from(filtered.data.statuses, (item) => item.id),
-  ['visible-post']
-);
-assert.deepEqual(
-  Array.from(filtered.data.comments, (item) => item.id),
-  ['visible-comment']
-);
-
-const unsafeFixture = JSON.parse(
-  '{"statuses":[{"id":"visible","user":{"idstr":"67890"}}],"__proto__":{"polluted":true},"constructor":{"polluted":true}}'
-);
-const unsafeResult = testAPI.transformContentResponseData(
-  unsafeFixture,
-  'https://weibo.com/ajax/statuses/mymblog'
-);
-assert.equal(unsafeResult.changed, true);
-assert.equal(Object.getPrototypeOf(unsafeResult.data).polluted, undefined);
-assert.equal(
-  Object.prototype.hasOwnProperty.call(unsafeResult.data, '__proto__'),
-  false
-);
-assert.equal(
-  Object.prototype.hasOwnProperty.call(unsafeResult.data, 'constructor'),
-  false
-);
-
-const untouched = { statuses: [{ id: 'visible', user: { idstr: '67890' } }] };
-const untouchedResult = testAPI.transformContentResponseData(
-  untouched,
-  'https://weibo.com/ajax/statuses/mymblog'
-);
-assert.equal(untouchedResult.changed, false);
-assert.equal(untouchedResult.data, untouched);
-
-assert.equal(
-  testAPI.isFilterableContentURL('https://weibo.com/ajax/feed/hottimeline'),
-  false
-);
-[
-  'unreadfriendstimeline',
-  'friendstimeline',
-  'groupstimeline',
-  'hottimeline',
-  'allGroups',
-].forEach((endpoint) => {
-  assert.equal(
-    testAPI.isFilterableContentURL(
-      `https://weibo.com/ajax/feed/${endpoint}`
-    ),
-    false,
-    `${endpoint} must preserve native statuses and pagination cursors`
-  );
-});
-assert.equal(
-  testAPI.isFilterableContentURL(
-    'https://weibo.com/ajax/statuses/mymblog'
-  ),
-  true
+// 故障形式一：将自行构造的响应交回页面。
+assert.doesNotMatch(
+  source,
+  /new\s+Response\s*\(/,
+  '不得把自行构造的 Response 交给页面，分页器需要原样的响应'
 );
 assert.doesNotMatch(source, /EMPTY_UNREAD_TIMELINE_RESPONSE/);
 assert.doesNotMatch(
   source,
   /timelineDefault\.value\s*&&\s*request\.unreadTimeline/
 );
-assert.doesNotMatch(source, /ENABLE_PAGE_NETWORK_INTERCEPTION/);
-assert.doesNotMatch(source, /window\.fetch\s*=/);
-assert.doesNotMatch(source, /XMLHttpRequest\.prototype\.(?:open|send|abort)\s*=/);
+
+// 故障形式二：改写 XHR 的响应读取属性，等价于改写内容。
+assert.doesNotMatch(
+  source,
+  /defineProperty\s*\([^;]*?\b(?:responseText|responseXML|responseType)\b/,
+  '不得改写 XHR 的响应读取属性'
+);
+
+// 故障形式三：接管请求生命周期。abort 决定请求何时终止，WebSocket 决定长连接
+// 是否存在，替换后页面的重试与续页逻辑不再由微博自身控制。
+assert.doesNotMatch(source, /XMLHttpRequest\.prototype\.abort\s*=/);
 assert.doesNotMatch(source, /window\.WebSocket\s*=/);
+
+// 故障形式四：包装 fetch 时消费原始响应体。响应体只能读取一次，观察层必须
+// 通过 clone() 读取副本。
+assert.match(
+  source,
+  /window\.fetch\s*=\s*function\s+wbObservedFetch/,
+  '观察层必须使用具名包装体，便于在调用栈中识别'
+);
+assert.match(
+  source,
+  /\.clone\(\)\s*\n?\s*\.text\(\)/,
+  '观察层必须通过 clone().text() 读取响应副本'
+);
+
+// 故障形式五：观察层改写请求或响应。包装体必须原样返回原生结果。
+const contentObserverSource = sourceBetween(
+  '  (function installContentResponseObserver() {',
+  '  const DOM_UID_SELECTOR = ['
+);
+assert.match(contentObserverSource, /const result = Reflect\.apply\(nativeFetch, this, args\)/);
+assert.match(contentObserverSource, /return result;/);
+assert.match(contentObserverSource, /return Reflect\.apply\(nativeOpen, this, arguments\)/);
+assert.match(contentObserverSource, /return Reflect\.apply\(nativeSend, this, arguments\)/);
+assert.doesNotMatch(contentObserverSource, /args\[\d\]\s*=/);
+
+// ═══ 广告识别：接口回包登记 + DOM 侧按微博 id 隐藏 ════════════════════════
+
+const adRuntime = {
+  refreshCalls: 0,
+};
+const adContext = vm.createContext({
+  CONTENT_FILTER_CFG: { hideAds: true },
+  URL,
+  console,
+  document: {},
+  location: { origin: 'https://weibo.com' },
+  queueBlockedDOMRefresh: () => {
+    adRuntime.refreshCalls += 1;
+  },
+});
+vm.runInContext(
+  `${sourceBetween(
+    '  function isUnsafeObjectKey(key) {',
+    '  function copySafeEnumerableData(source) {'
+  )}
+  ${sourceBetween(
+    '  function hasExplicitAdMarker(obj) {',
+    '  (function installContentResponseObserver() {'
+  )}
+  globalThis.adAPI = {
+    hasExplicitAdMarker,
+    rememberAdPostID,
+    isKnownAdPostID,
+    collectAdPostIDs,
+    observeContentResponse,
+    AD_POST_IDS,
+    AD_POST_ID_LIMIT,
+  };`,
+  adContext
+);
+const { adAPI } = adContext;
+
+// 接口对广告微博下发三种标记，任意一种成立即判定为广告。
+assert.equal(adAPI.hasExplicitAdMarker({ isAd: true }), true);
+assert.equal(adAPI.hasExplicitAdMarker({ readtimetype: 'adMblog' }), true);
 assert.equal(
-  testAPI.isFilterableContentURL(
-    'https://example.com/ajax/feed/hottimeline'
+  adAPI.hasExplicitAdMarker({ mark: '999_reallog_mark_ad:999|WeiboADNatural' }),
+  true
+);
+// 普通微博的阅读类型与埋点串不得被误判。
+assert.equal(adAPI.hasExplicitAdMarker({ readtimetype: 'mblog' }), false);
+assert.equal(adAPI.hasExplicitAdMarker({ mark: 'benchmark_adjacent' }), false);
+assert.equal(adAPI.hasExplicitAdMarker({}), false);
+
+// 回包解析只登记带广告标记的条目，转发内层与外层分别判定。
+adAPI.AD_POST_IDS.clear();
+adAPI.collectAdPostIDs({
+  statuses: [
+    { mblogid: 'AdOne11', isAd: true },
+    { mblogid: 'Normal11' },
+    { mblogid: 'AdTwo22', readtimetype: 'adMblog' },
+    {
+      mblogid: 'Outer33',
+      retweeted_status: { mblogid: 'InnerAd4', isAd: true },
+    },
+  ],
+});
+assert.equal(adAPI.isKnownAdPostID('AdOne11'), true);
+assert.equal(adAPI.isKnownAdPostID('AdTwo22'), true);
+assert.equal(adAPI.isKnownAdPostID('InnerAd4'), true);
+assert.equal(adAPI.isKnownAdPostID('Normal11'), false);
+assert.equal(adAPI.isKnownAdPostID('Outer33'), false);
+assert.equal(adAPI.isKnownAdPostID(''), false);
+
+// 时间线可无限翻页，登记表必须有界并淘汰最早写入的条目。
+adAPI.AD_POST_IDS.clear();
+for (let i = 0; i < adAPI.AD_POST_ID_LIMIT + 5; i += 1) {
+  adAPI.rememberAdPostID(`id${i}`);
+}
+assert.equal(adAPI.AD_POST_IDS.size, adAPI.AD_POST_ID_LIMIT);
+assert.equal(adAPI.isKnownAdPostID('id0'), false);
+assert.equal(adAPI.isKnownAdPostID('id4'), false);
+assert.equal(
+  adAPI.isKnownAdPostID(`id${adAPI.AD_POST_ID_LIMIT + 4}`),
+  true
+);
+
+// 观察层只解析第一方微博域名下的 feed 与 statuses 接口。
+const adPayload = JSON.stringify({
+  statuses: [{ mblogid: 'ScopeAd1', isAd: true }],
+});
+[
+  ['https://weibo.com/ajax/feed/friendstimeline?count=25', true],
+  ['https://weibo.com/ajax/statuses/mymblog?uid=1', true],
+  ['https://s.weibo.com/ajax/statuses/search', true],
+  ['https://weibo.com/ajax/log/action', false],
+  ['https://weibo.com/ajax/profile/sidedetail', false],
+  ['https://weibo.com/ajax/side/cards', false],
+  ['https://example.com/ajax/feed/friendstimeline', false],
+  ['https://weibo.com/anything?next=/ajax/feed/friendstimeline', false],
+].forEach(([url, shouldRegister]) => {
+  adAPI.AD_POST_IDS.clear();
+  adAPI.observeContentResponse(url, adPayload);
+  assert.equal(
+    adAPI.isKnownAdPostID('ScopeAd1'),
+    shouldRegister,
+    `${url} 的观察范围判定不符合预期`
+  );
+});
+
+// 回包可能晚于卡片渲染到达，登记表新增条目时必须补一次 DOM 扫描。
+adAPI.AD_POST_IDS.clear();
+adRuntime.refreshCalls = 0;
+adAPI.observeContentResponse(
+  'https://weibo.com/ajax/feed/friendstimeline',
+  adPayload
+);
+assert.equal(adRuntime.refreshCalls, 1);
+// 同一批回包重复到达时不再重复触发扫描。
+adAPI.observeContentResponse(
+  'https://weibo.com/ajax/feed/friendstimeline',
+  adPayload
+);
+assert.equal(adRuntime.refreshCalls, 1);
+
+// 非 JSON 响应与关闭开关时不做任何处理。
+adAPI.AD_POST_IDS.clear();
+adRuntime.refreshCalls = 0;
+adAPI.observeContentResponse(
+  'https://weibo.com/ajax/feed/friendstimeline',
+  '<html>not json</html>'
+);
+assert.equal(adRuntime.refreshCalls, 0);
+adContext.CONTENT_FILTER_CFG.hideAds = false;
+adAPI.observeContentResponse(
+  'https://weibo.com/ajax/feed/friendstimeline',
+  adPayload
+);
+assert.equal(adAPI.isKnownAdPostID('ScopeAd1'), false);
+adContext.CONTENT_FILTER_CFG.hideAds = true;
+
+// 卡片上的条目标识取自正文链接 /{uid}/{mblogid}，头像等用户链接不得命中。
+class FakeAdPostElement {
+  constructor(hrefs) {
+    this.hrefs = hrefs;
+  }
+
+  querySelectorAll() {
+    return this.hrefs.map((href) => ({ getAttribute: () => href }));
+  }
+}
+const permalinkContext = vm.createContext({
+  Element: FakeAdPostElement,
+});
+vm.runInContext(
+  `${sourceBetween(
+    '  const AD_POST_ID_LIMIT = 3000;',
+    '  function collectAdPostIDs('
+  )}
+  ${sourceBetween(
+    '  // 微博卡片内的正文链接形如 /{uid}/{mblogid}',
+    '  function hideRecognizedAds(root = document) {'
+  )}
+  rememberAdPostID('Perma123');
+  globalThis.permalinkAPI = { extractPostIDFromRoot, isRegisteredAdPostRoot };`,
+  permalinkContext
+);
+const { permalinkAPI } = permalinkContext;
+assert.equal(
+  permalinkAPI.extractPostIDFromRoot(
+    new FakeAdPostElement(['/u/1234567890', '/1234567890/Perma123'])
+  ),
+  'Perma123'
+);
+assert.equal(
+  permalinkAPI.extractPostIDFromRoot(
+    new FakeAdPostElement(['//weibo.com/1234567890/Perma123?pagetype=profilefeed'])
+  ),
+  'Perma123'
+);
+assert.equal(
+  permalinkAPI.extractPostIDFromRoot(
+    new FakeAdPostElement(['https://weibo.com/1234567890/Perma123'])
+  ),
+  'Perma123'
+);
+assert.equal(
+  permalinkAPI.extractPostIDFromRoot(
+    new FakeAdPostElement(['/u/1234567890', '/n/nickname', '/hot/weibo'])
+  ),
+  ''
+);
+assert.equal(permalinkAPI.extractPostIDFromRoot(null), '');
+assert.equal(
+  permalinkAPI.isRegisteredAdPostRoot(
+    new FakeAdPostElement(['/1234567890/Perma123'])
+  ),
+  true
+);
+assert.equal(
+  permalinkAPI.isRegisteredAdPostRoot(
+    new FakeAdPostElement(['/1234567890/Other999'])
   ),
   false
 );
-assert.equal(
-  testAPI.isFilterableContentURL(
-    'https://weibo.com/anything?next=/ajax/feed/hottimeline'
+
+// 虚拟列表回收壳时按登记表重新核对当前条目，避免复用后的正常微博继续被隐藏。
+assert.match(
+  sourceBetween(
+    '  function stillLooksLikeRecognizedAd(node) {',
+    '  function stillLooksLikeTimelineRecommendation(node) {'
   ),
-  false
+  /isRegisteredAdPostRoot\(node\)/
 );
+// DOM 侧命中登记表的卡片与带可见广告文案的卡片走同一条隐藏路径。
+assert.match(
+  sourceBetween(
+    '  function hideRecognizedAds(root = document) {',
+    '  function restoreRecognizedAds(root = document) {'
+  ),
+  /hasExplicitAdLabel\(item\) \|\| isRegisteredAdPostRoot\(item\)/
+);
+
 console.log('regression tests: PASS');
 
 })().catch((error) => {

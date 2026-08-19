@@ -4,7 +4,7 @@
 // @name:zh-CN   Pynseq for Weibo｜屏序·微博
 // @name:en      Pynseq for Weibo｜屏序·微博
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
-// @version      2.3.6
+// @version      2.4.0
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
 // @description:en Restore a chronological Weibo timeline, locally block unwanted users, filter ads, simplify navigation, and manage official Weibo blocklist synchronization.
 // @author       DanielZenFlow
@@ -41,7 +41,7 @@
   const WB_INTERNAL = Object.create(null);
   const THROTTLE_MS = 350; // 新浪微博官方黑名单分页请求间隔（毫秒）
   const SCRIPT_NAME = 'Pynseq for Weibo｜屏序·微博';
-  const SCRIPT_VERSION = '2.3.6';
+  const SCRIPT_VERSION = '2.4.0';
   const GITHUB_URL = 'https://github.com/DanielZenFlow/Pynseq-Weibo';
   const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/danielzenflow';
   const ONBOARDING_DONE_KEY = 'pynseq_for_weibo_onboarding_done_v1';
@@ -2057,95 +2057,6 @@
 
   WB_INTERNAL.applyConfig = applyRuntimeConfig;
 
-  const MAX_FILTER_DEPTH = 80;
-
-  function isLikelyUserPayload(obj) {
-    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
-    return [
-      'screen_name',
-      'profile_url',
-      'profile_image_url',
-      'avatar_hd',
-      'avatar_large',
-      'verified',
-      'gender',
-      'followers_count',
-      'follow_count',
-    ].some((key) => Object.prototype.hasOwnProperty.call(obj, key));
-  }
-
-  function addUIDIfValid(targetSet, value) {
-    const uid = String(value || '').trim();
-    if (/^\d{5,}$/.test(uid)) targetSet.add(uid);
-  }
-
-  function addDirectOwnerUIDs(targetSet, obj) {
-    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
-    addUIDIfValid(targetSet, obj.uid);
-    addUIDIfValid(targetSet, obj.user_id);
-    addUIDIfValid(targetSet, obj.userId);
-
-    if (isLikelyUserPayload(obj)) {
-      addUIDIfValid(targetSet, obj.id);
-      addUIDIfValid(targetSet, obj.idstr);
-    }
-
-    const user = obj.user;
-    if (user && typeof user === 'object' && !Array.isArray(user)) {
-      addUIDIfValid(targetSet, user.uid);
-      addUIDIfValid(targetSet, user.user_id);
-      addUIDIfValid(targetSet, user.userId);
-      addUIDIfValid(targetSet, user.id);
-      addUIDIfValid(targetSet, user.idstr);
-    }
-  }
-
-  function extractDirectContentUIDs(item) {
-    const uids = new Set();
-    addDirectOwnerUIDs(uids, item);
-    ['mblog', 'status', 'retweeted_status'].forEach((key) => {
-      addDirectOwnerUIDs(uids, item?.[key]);
-    });
-    return uids;
-  }
-
-  function isBlacklistCategoryEnabled(category) {
-    const settingByCategory = {
-      posts: 'hideBlacklistPosts',
-      comments: 'hideBlacklistComments',
-      searchResults: 'hideBlacklistSearchResults',
-      userCards: 'hideBlacklistUserCards',
-      interactions: 'hideBlacklistInteractions',
-    };
-    const setting = settingByCategory[category] || settingByCategory.posts;
-    return CONTENT_FILTER_CFG[setting] !== false;
-  }
-
-  function isStandaloneUserCardPayload(item) {
-    return isLikelyUserPayload(item);
-  }
-
-  function getNestedBlacklistCategory(key, fallbackCategory) {
-    if (/^(?:comments?|replies|replys|comment_list)$/i.test(key)) {
-      return 'comments';
-    }
-    if (
-      /^(?:reposts?|likes?|attitudes?|interactions?|repost_list|like_list)$/i.test(
-        key
-      )
-    ) {
-      return 'interactions';
-    }
-    if (
-      /^(?:users?|user_list|recommend_users|recommended_users|suggestions)$/i.test(
-        key
-      )
-    ) {
-      return 'userCards';
-    }
-    return fallbackCategory;
-  }
-
   function hasExplicitAdMarker(obj) {
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
     const truthyAdFlag = ['is_ad', 'isAd', 'is_ads', 'is_advert'].some(
@@ -2164,6 +2075,13 @@
       return value !== undefined && value !== null && String(value).trim() !== '';
     });
     if (hasAdID) return true;
+
+    // 时间线回包对广告微博还会附带两个标记：阅读类型为 adMblog，埋点串 mark 内
+    // 含 mark_ad 段。两者与 isAd 同时出现，单独出现时同样表示广告投放。
+    if (String(obj.readtimetype || '') === 'adMblog') return true;
+    if (/(?:^|[^a-z0-9])mark_ad(?![a-z0-9])/i.test(String(obj.mark || ''))) {
+      return true;
+    }
 
     if (
       obj.ad_info ||
@@ -2189,77 +2107,6 @@
     });
   }
 
-  function filterContentTree(
-    obj,
-    responseCategory,
-    options = {},
-    context = {
-      seen: new WeakMap(),
-      changed: false,
-    },
-    depth = 0
-  ) {
-    if (!obj || typeof obj !== 'object') return obj;
-    if (depth > MAX_FILTER_DEPTH) return obj;
-    if (context.seen.has(obj)) return context.seen.get(obj);
-
-    if (Array.isArray(obj)) {
-      const out = [];
-      context.seen.set(obj, out);
-      obj.forEach((item) => {
-        if (options.filterAds && hasExplicitAdMarker(item)) {
-          context.changed = true;
-          return;
-        }
-        const itemCategory = isStandaloneUserCardPayload(item)
-          ? 'userCards'
-          : responseCategory;
-        if (
-          options.filterBlacklist &&
-          isBlacklistCategoryEnabled(itemCategory) &&
-          [...extractDirectContentUIDs(item)].some((uid) => BL.has(uid))
-        ) {
-          context.changed = true;
-          return;
-        }
-        out.push(
-          filterContentTree(
-            item,
-            responseCategory,
-            options,
-            context,
-            depth + 1
-          )
-        );
-      });
-      return out;
-    }
-
-    const out = {};
-    context.seen.set(obj, out);
-    for (const [key, value] of Object.entries(obj)) {
-      if (isUnsafeObjectKey(key)) {
-        context.changed = true;
-        continue;
-      }
-      const nestedCategory = getNestedBlacklistCategory(key, responseCategory);
-      defineSafeEnumerableValue(
-        out,
-        key,
-        value && typeof value === 'object'
-          ? filterContentTree(
-              value,
-              nestedCategory,
-              options,
-              context,
-              depth + 1
-            )
-          : value
-      );
-    }
-    return out;
-  }
-
   const FILTERABLE_WEIBO_HOSTS = new Set([
     'weibo.com',
     'www.weibo.com',
@@ -2278,106 +2125,139 @@
     }
   }
 
-  const DOM_FILTERED_TIMELINE_PATH =
-    /^\/ajax\/feed\/(?:allGroups|unreadfriendstimeline|friendstimeline|groupstimeline|hottimeline)\/?$/i;
+  // 微博接口对广告微博下发 isAd / readtimetype / mark 三种标记，页面上没有对应的
+  // 可见文案：角标文案为「广告」时微博渲染为图片，DOM 内既无文字也无稳定类名。
+  // 广告识别因此分成两步：回包侧只读地登记广告微博 id，DOM 侧按 id 隐藏对应卡片。
+  //
+  // 观察层只读取响应副本，不改写返回内容、状态码和响应头。首页时间线的分页器依赖
+  // 未经删减的 statuses 与游标，任何对回包内容的改写都会让原生组件回退旧缓存并
+  // 永久保持加载状态，所以隐藏动作一律放在 DOM 侧完成。
+  const AD_POST_ID_LIMIT = 3000;
+  const AD_POST_IDS = new Set();
+  const OBSERVED_RESPONSE_PATH_RE = /^\/ajax\/(?:feed|statuses)\//i;
+  const AD_PAYLOAD_MAX_DEPTH = 12;
+  const POST_PERMALINK_RE = /^\/(\d{4,})\/([A-Za-z0-9]{6,})(?:[/?#]|$)/;
 
-  function isFilterableContentURL(url) {
+  function rememberAdPostID(id) {
+    const key = String(id || '').trim();
+    if (!key) return;
+    // 时间线可以无限翻页，登记表必须自行淘汰最早的条目，避免长时间浏览后无界增长。
+    if (!AD_POST_IDS.has(key) && AD_POST_IDS.size >= AD_POST_ID_LIMIT) {
+      const oldest = AD_POST_IDS.values().next().value;
+      if (oldest !== undefined) AD_POST_IDS.delete(oldest);
+    }
+    AD_POST_IDS.add(key);
+  }
+
+  function isKnownAdPostID(id) {
+    const key = String(id || '').trim();
+    return !!key && AD_POST_IDS.has(key);
+  }
+
+  function collectAdPostIDs(payload, depth = 0) {
+    if (!payload || typeof payload !== 'object' || depth > AD_PAYLOAD_MAX_DEPTH) {
+      return;
+    }
+    if (Array.isArray(payload)) {
+      payload.forEach((item) => collectAdPostIDs(item, depth + 1));
+      return;
+    }
+    const postID = payload.mblogid;
+    if (postID && hasExplicitAdMarker(payload)) {
+      rememberAdPostID(postID);
+    }
+    Object.keys(payload).forEach((key) => {
+      if (isUnsafeObjectKey(key)) return;
+      collectAdPostIDs(payload[key], depth + 1);
+    });
+  }
+
+  function observeContentResponse(url, text) {
+    if (typeof text !== 'string' || text.length < 2) return;
+    if (CONTENT_FILTER_CFG.hideAds !== true) return;
     const parsed = parseFirstPartyWeiboURL(url);
-    if (!parsed) return false;
-    const path = parsed.pathname;
-    // 微博分页器必须接收未经删减的 statuses 与游标。若接口层把整页
-    // 过滤为空，原生组件会回退旧缓存并永久保持加载状态。主页时间线
-    // 交由现有 DOM 过滤器隐藏整条容器，同时保留原生分页行为。
-    if (DOM_FILTERED_TIMELINE_PATH.test(path)) return false;
-    return (
-      /^\/ajax\/(?:feed|statuses|comment|getCommentList|repost|like|recommend|suggest|users?|usercard|profile|friendships)(?:\/|$)/i.test(
-        path
-      ) ||
-      /^\/graphql\//i.test(path) ||
-      /^\/(?:mymblog|timeline|index)(?:\/|$)/i.test(path)
-    );
-  }
-
-  function getBlacklistResponseCategory(url) {
-    if (
-      /\/ajax\/(?:comment|getCommentList)|\/ajax\/statuses\/(?:buildComments|comment|reply)/i.test(
-        url
-      )
-    ) {
-      return 'comments';
+    if (!parsed || !OBSERVED_RESPONSE_PATH_RE.test(parsed.pathname)) return;
+    let payload;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      return;
     }
-    if (
-      /\/ajax\/(?:repost|like)|\/ajax\/statuses\/(?:repost|like)/i.test(url)
-    ) {
-      return 'interactions';
+    const knownBefore = AD_POST_IDS.size;
+    try {
+      collectAdPostIDs(payload);
+    } catch {
+      /* 观察层出错不得影响页面 */
     }
-    if (
-      /\/(?:ajax\/)?(?:recommend|suggest|user(?:s|card)?|profile|friendships)(?:\/|[?#]|$)/i.test(
-        url
-      )
-    ) {
-      return 'userCards';
+    // 回包可能晚于卡片渲染到达。登记表新增条目时补一次扫描，否则这批广告要等到
+    // 下一次 DOM 变动才会被隐藏。
+    if (AD_POST_IDS.size !== knownBefore) {
+      queueBlockedDOMRefresh(document, 60);
     }
-    if (isWeiboSearchResultPage()) {
-      return 'searchResults';
+  }
+
+  // 安装观察层。包装体把原生返回值原样交还调用方，读取一律走响应副本，避免消耗
+  // 页面自身要读取的响应体。
+  (function installContentResponseObserver() {
+    const nativeFetch = window.fetch;
+    if (typeof nativeFetch === 'function') {
+      window.fetch = function wbObservedFetch(...args) {
+        const result = Reflect.apply(nativeFetch, this, args);
+        try {
+          const input = args[0];
+          const requestURL =
+            typeof input === 'string'
+              ? input
+              : input && typeof input.url === 'string'
+                ? input.url
+                : String(input || '');
+          Promise.resolve(result)
+            .then((response) => {
+              if (!response || typeof response.clone !== 'function') return;
+              response
+                .clone()
+                .text()
+                .then((text) => observeContentResponse(requestURL, text))
+                .catch(() => {});
+            })
+            .catch(() => {});
+        } catch {
+          /* 观察层出错不得影响页面 */
+        }
+        return result;
+      };
     }
-    return 'posts';
-  }
 
-  function shouldFilterBlacklistResponse() {
-    if (isRelationshipListPage()) return false;
-    return [
-      'posts',
-      'comments',
-      'searchResults',
-      'userCards',
-      'interactions',
-    ].some(isBlacklistCategoryEnabled);
-  }
-
-  function transformContentResponseData(data, url = '') {
-    const responseURL = String(url || '');
-    const options = {
-      filterAds: CONTENT_FILTER_CFG.hideAds === true,
-      filterBlacklist: shouldFilterBlacklistResponse(),
-    };
-    if (!options.filterAds && !options.filterBlacklist) {
-      return { data, changed: false };
+    const nativeOpen = XMLHttpRequest.prototype.open;
+    const nativeSend = XMLHttpRequest.prototype.send;
+    if (typeof nativeOpen === 'function' && typeof nativeSend === 'function') {
+      XMLHttpRequest.prototype.open = function wbObservedOpen(method, url) {
+        try {
+          this.__wbObservedURL = String(url || '');
+        } catch {
+          /* 观察层出错不得影响页面 */
+        }
+        return Reflect.apply(nativeOpen, this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function wbObservedSend() {
+        try {
+          this.addEventListener('load', () => {
+            try {
+              // responseType 非空时 responseText 会抛错，读取前先确认是文本响应。
+              const type = String(this.responseType || '');
+              if (type !== '' && type !== 'text') return;
+              observeContentResponse(this.__wbObservedURL, this.responseText);
+            } catch {
+              /* 观察层出错不得影响页面 */
+            }
+          });
+        } catch {
+          /* 观察层出错不得影响页面 */
+        }
+        return Reflect.apply(nativeSend, this, arguments);
+      };
     }
-    const context = {
-      seen: new WeakMap(),
-      changed: false,
-    };
-    const filtered = filterContentTree(
-      data,
-      getBlacklistResponseCategory(responseURL),
-      options,
-      context
-    );
-    return {
-      data: context.changed ? filtered : data,
-      changed: context.changed,
-    };
-  }
-
-  function isRelationshipFriendsURL(url) {
-    const parsed = parseFirstPartyWeiboURL(url);
-    return !!parsed && /^\/ajax\/friendships\/friends\/?$/i.test(parsed.pathname);
-  }
-
-  function normalizeRelationshipFriendsData(data) {
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
-    const hasOfficialFilteredUsers =
-      data.has_filtered_fans === true || data.has_filtered_attentions === true;
-    if (!hasOfficialFilteredUsers) return data;
-
-    const displayTotal = Number(data.display_total_number);
-    if (!Number.isFinite(displayTotal) || displayTotal < 0) return data;
-
-    const normalized = copySafeEnumerableData(data);
-    normalized.total_number = displayTotal;
-    return normalized;
-  }
+  })();
 
   const DOM_UID_SELECTOR = [
     '[data-user-id]',
@@ -4461,6 +4341,26 @@
     );
   }
 
+  // 微博卡片内的正文链接形如 /{uid}/{mblogid}，是页面上唯一稳定的条目标识。
+  // 取到的 id 用于和回包侧登记的广告 id 比对。
+  function extractPostIDFromRoot(root) {
+    if (!(root instanceof Element)) return '';
+    const anchors = root.querySelectorAll('a[href]');
+    for (const anchor of anchors) {
+      const href = String(anchor.getAttribute('href') || '');
+      if (!href) continue;
+      const path = href.replace(/^(?:https?:)?\/\/[^/]+/i, '');
+      const matched = POST_PERMALINK_RE.exec(path);
+      if (matched) return matched[2];
+    }
+    return '';
+  }
+
+  function isRegisteredAdPostRoot(root) {
+    if (!(root instanceof Element) || !AD_POST_IDS.size) return false;
+    return isKnownAdPostID(extractPostIDFromRoot(root));
+  }
+
   function hideRecognizedAds(root = document) {
     if (
       !CONTENT_FILTER_CFG.hideAds ||
@@ -4497,8 +4397,15 @@
     root
       .querySelectorAll(DOM_POST_ROOT_SELECTOR)
       .forEach((item) => candidates.push(item));
+    if (root instanceof Element) {
+      // MutationObserver 交来的常常是卡片内部的子树，条目标识挂在外层卡片上。
+      const containingPost = root.closest(DOM_POST_ROOT_SELECTOR);
+      if (containingPost) candidates.push(containingPost);
+    }
     candidates.forEach((item) => {
-      if (hasExplicitAdLabel(item)) contentRoots.add(item);
+      if (hasExplicitAdLabel(item) || isRegisteredAdPostRoot(item)) {
+        contentRoots.add(item);
+      }
     });
 
     let hiddenAny = false;
@@ -5464,7 +5371,9 @@
     return (
       node.matches(EXPLICIT_AD_SELECTOR) ||
       !!node.querySelector(EXPLICIT_AD_SELECTOR) ||
-      hasExplicitAdLabel(node)
+      hasExplicitAdLabel(node) ||
+      // 虚拟列表会把同一个壳复用给另一条微博，按登记表重新核对当前条目标识。
+      isRegisteredAdPostRoot(node)
     );
   }
 
@@ -5489,6 +5398,10 @@
       // 的正常微博会继续沿用上一条广告的隐藏状态。
       if (!stillLooksLikeRecognizedAd(node)) {
         node.removeAttribute(HIDDEN_AD_ATTR);
+        // 移除标记只恢复壳的原始高度，DynamicScroller 仍缓存隐藏期间的 2px 测量
+        // 值。不补发重测时，复用后的正常微博会被压缩显示，后续行坐标随之错位。
+        // 黑名单与推荐内容两条恢复路径同样在此处补发重测。
+        requestNativeVirtualItemRemeasure(node);
       }
     });
   }
@@ -6858,17 +6771,17 @@
           <div class="wbset-onboard-step">
             <div class="wbset-onboard-kicker">设置向导</div>
             <h1 id="wbset-onboard-title">屏其不欲见者，复其应有之序。</h1>
-            <p>在时间线、评论、搜索、推荐卡片与互动列表中隐藏本地名单用户，同时整理导航、侧栏与广告内容。</p>
+            <p>在时间线、评论、搜索、推荐卡片与互动列表中隐藏本地名单用户，同时整理导航、侧栏与 isAd 标记的广告内容。</p>
           </div>`;
       } else if (stepIndex === 1) {
         body.innerHTML = `
           <div class="wbset-onboard-step">
             <div class="wbset-onboard-kicker">浏览与操作</div>
             <h1 id="wbset-onboard-title">选择默认时间线和快捷入口</h1>
-            <p>右键屏蔽始终可用；时间线、广告过滤、设置按钮与操作确认可以分别启用。</p>
+            <p>右键屏蔽始终可用；时间线、isAd 广告过滤、设置按钮与操作确认可以分别启用。</p>
             <div class="wbset-onboard-options">
               <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>主页默认显示「最新微博」</strong><span>打开首页时优先进入按时间排序的全部关注时间线。</span></span><input type="checkbox" data-wbset-setting="defaultLatestTimeline"></label>
-              <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>隐藏广告和推广微博</strong><span>过滤带广告、推广或赞助标识的内容。</span></span><input type="checkbox" data-wbset-setting="hideAds"></label>
+              <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>屏蔽 isAd 相关标签广告</strong><span>依据微博接口下发的 isAd 广告标记隐藏微博，包含关注博主发布的商业推广。</span></span><input type="checkbox" data-wbset-setting="hideAds"></label>
               <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>隐藏时间线推荐内容</strong><span>移除插入关注时间线的“你可能感兴趣的内容”。</span></span><input type="checkbox" data-wbset-setting="hideTimelineRecommendations"></label>
               <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>显示右下角设置按钮</strong><span>关闭后仍可从 Tampermonkey 菜单中的「设置」进入。</span></span><input type="checkbox" data-wbset-setting="showSettingsButton"></label>
               <label class="wbset-onboard-option"><span class="wbset-onboard-option-copy"><strong>屏蔽用户前确认</strong><span>通过右键菜单屏蔽时先显示确认对话框。</span></span><input type="checkbox" data-wbset-setting="confirmBeforeBlocking"></label>
@@ -6905,7 +6818,7 @@
             <p>完成后立即应用；所有选项之后仍可在脚本设置中修改。</p>
             <div class="wbset-onboard-summary">
               <div><span>最新微博时间线</span><strong>${draft.defaultLatestTimeline ? '开启' : '关闭'}</strong></div>
-              <div><span>广告过滤</span><strong>${draft.hideAds ? '开启' : '关闭'}</strong></div>
+              <div><span>isAd 广告过滤</span><strong>${draft.hideAds ? '开启' : '关闭'}</strong></div>
               <div><span>时间线推荐过滤</span><strong>${draft.hideTimelineRecommendations ? '开启' : '关闭'}</strong></div>
               <div><span>快捷设置按钮</span><strong>${draft.showSettingsButton ? '显示' : '隐藏'}</strong></div>
               <div><span>屏蔽前确认</span><strong>${draft.confirmBeforeBlocking ? '开启' : '关闭'}</strong></div>
@@ -6998,7 +6911,7 @@
               <section class="wbset-page is-active" role="tabpanel" data-wbset-section="general">
                 <div class="wbset-page-head">
                   <h3>常规</h3>
-                  <p>控制时间线、搜索结果和广告过滤的默认行为。</p>
+                  <p>控制时间线、搜索结果和 isAd 广告过滤的默认行为。</p>
                 </div>
                 <div class="wbset-sec">
                   <div class="wbset-sec-title">设置向导</div>
@@ -7018,7 +6931,7 @@
                     <input type="checkbox" id="wbset-search-related-users">
                   </label>
                   <label class="wbset-setting">
-                    <span class="wbset-setting-copy"><strong>隐藏广告和推广微博</strong><span>识别接口广告标记及页面中的广告、推广和赞助标识。</span></span>
+                    <span class="wbset-setting-copy"><strong>屏蔽 isAd 相关标签广告</strong><span>依据微博接口下发的 isAd 广告标记隐藏对应微博。关注博主发布的商业推广同样带有该标记，开启后会一并隐藏。</span></span>
                     <input type="checkbox" id="wbset-hide-ads">
                   </label>
                   <label class="wbset-setting">
