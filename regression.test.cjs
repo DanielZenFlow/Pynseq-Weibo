@@ -667,8 +667,8 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+2\.4\.53/);
-assert.match(source, /const SCRIPT_VERSION = '2\.4\.53'/);
+assert.match(source, /@version\s+2\.4\.54/);
+assert.match(source, /const SCRIPT_VERSION = '2\.4\.54'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
@@ -3364,6 +3364,7 @@ vm.runInContext(
     classifyAdPostOwner,
     resolveAdPostOwner,
     describeAdPostOwner,
+    findAdOriginItem,
     readCurrentUserIDFromDOM,
     isHiddenAdOwner,
     getCurrentUserID,
@@ -3404,7 +3405,9 @@ assert.equal(!!adAPI.getAdPostOwner('AdOne11'), true);
 assert.equal(!!adAPI.getAdPostOwner('AdTwo22'), true);
 assert.equal(!!adAPI.getAdPostOwner('InnerAd4'), true);
 assert.equal(!!adAPI.getAdPostOwner('Normal11'), false);
-assert.equal(!!adAPI.getAdPostOwner('Outer33'), false);
+// 转发外层也要登记：卡片正文链接取到的是外层标识，只登记内层的话转发卡片在
+// DOM 侧命中不了登记表。
+assert.equal(!!adAPI.getAdPostOwner('Outer33'), true);
 assert.equal(!!adAPI.getAdPostOwner(''), false);
 
 // 广告按作者与当前账号的关系分为本人、关注、非关注三档。
@@ -3522,6 +3525,69 @@ assert.equal(adAPI.readCurrentUserIDFromDOM(), '1635218563');
 adContext.document.querySelectorAll = () => [];
 assert.equal(adAPI.readCurrentUserIDFromDOM(), '');
 delete adContext.document.querySelectorAll;
+
+// 转发的广告由原微博决定归档。转发者只是把同一条广告再发一次，用户关心的是这条
+// 广告的作者与自己的关系：转发已关注博主的广告应当由「关注博主发布的广告」管辖，
+// 不能因为转发者是自己就落到「本人发布的广告」——自己的微博上 user.following 是
+// false，那样还会顺带落进「非关注博主」。
+adAPI.AD_POST_OWNERS.clear();
+adAPI.collectAdPosts({
+  statuses: [
+    {
+      mblogid: 'MyRepost',
+      isAd: true,
+      user: { idstr: '1635218563', following: false },
+      retweeted_status: {
+        mblogid: 'OriginAd',
+        isAd: true,
+        user: { idstr: '7483050868', following: true },
+      },
+    },
+  ],
+});
+assert.equal(
+  adAPI.resolveAdPostOwner(adAPI.getAdPostOwner('MyRepost')),
+  'following',
+  'a repost of a followed blogger ad belongs to the following tier'
+);
+assert.equal(
+  adAPI.resolveAdPostOwner(adAPI.getAdPostOwner('OriginAd')),
+  'following'
+);
+// 自己出钱推广自己的转发时，广告标记只落在外层，归档回到外层作者。
+adAPI.AD_POST_OWNERS.clear();
+adAPI.collectAdPosts({
+  statuses: [
+    {
+      mblogid: 'PaidRepo',
+      isAd: true,
+      user: { idstr: '1635218563', following: false },
+      retweeted_status: {
+        mblogid: 'PlainOne',
+        user: { idstr: '7483050868', following: true },
+      },
+    },
+  ],
+});
+assert.equal(
+  adAPI.resolveAdPostOwner(adAPI.getAdPostOwner('PaidRepo')),
+  'self',
+  'only the outer post carries the marker, so it stays with its own author'
+);
+assert.equal(!!adAPI.getAdPostOwner('PlainOne'), false);
+// 转发链取最内层带广告标记的一条。
+const originOfChain = adAPI.findAdOriginItem({
+  mblogid: 'L1',
+  isAd: true,
+  user: { idstr: 'a' },
+  retweeted_status: {
+    mblogid: 'L2',
+    isAd: true,
+    user: { idstr: 'b' },
+    retweeted_status: { mblogid: 'L3', user: { idstr: 'c' } },
+  },
+});
+assert.equal(originOfChain.mblogid, 'L2');
 
 // 时间线可无限翻页，登记表必须有界并淘汰最早写入的条目。
 adAPI.AD_POST_OWNERS.clear();

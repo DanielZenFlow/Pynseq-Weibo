@@ -4,7 +4,7 @@
 // @name:zh-CN   Pynseq for Weibo｜屏序·微博｜本地屏蔽名单与时间线控制｜屏蔽热搜
 // @name:en      Pynseq for Weibo｜屏序·微博｜本地屏蔽名单与时间线控制｜屏蔽热搜
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
-// @version      2.4.53
+// @version      2.4.54
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
 // @description:en Restore a chronological Weibo timeline, locally block unwanted users, filter ads, simplify navigation, and manage official Weibo blocklist synchronization.
 // @author       DanielZenFlow
@@ -41,7 +41,7 @@
   const WB_INTERNAL = Object.create(null);
   const THROTTLE_MS = 350; // 新浪微博官方黑名单分页请求间隔（毫秒）
   const SCRIPT_NAME = 'Pynseq for Weibo｜屏序·微博';
-  const SCRIPT_VERSION = '2.4.53';
+  const SCRIPT_VERSION = '2.4.54';
   const GITHUB_URL = 'https://github.com/DanielZenFlow/Pynseq-Weibo';
   const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/danielzenflow';
   const ONBOARDING_DONE_KEY = 'pynseq_for_weibo_onboarding_done_v1';
@@ -2391,6 +2391,31 @@
     return currentUserIDCache;
   }
 
+  // 转发的广告由原微博决定归档。转发者只是把同一条广告再发一次，用户关心的是
+  // 这条广告的作者与自己的关系：转发已关注博主的广告，应当由「关注博主发布的
+  // 广告」管辖，而不是因为转发者是自己就落到「本人发布的广告」。自己出钱推广
+  // 自己的转发时，广告标记只落在外层，归档因此回到外层作者。取转发链上最内层
+  // 带广告标记的那一条即可同时满足这两种情形。
+  const AD_RETWEET_CHAIN_MAX_DEPTH = 4;
+
+  function findAdOriginItem(item) {
+    const chain = [];
+    let current = item;
+    while (
+      current &&
+      typeof current === 'object' &&
+      !Array.isArray(current) &&
+      chain.length < AD_RETWEET_CHAIN_MAX_DEPTH
+    ) {
+      chain.push(current);
+      current = current.retweeted_status;
+    }
+    for (let index = chain.length - 1; index >= 0; index -= 1) {
+      if (hasExplicitAdMarker(chain[index])) return chain[index];
+    }
+    return item;
+  }
+
   // 登记表存作者身份，不存分档结果。当前登录 uid 可能晚于回包才可读，把分档在
   // 解析回包时定死，本人发布的广告会被记成「非关注博主」——自己的微博上
   // user.following 就是 false，一旦本人判定没生效就只剩这一档可落。分档改到隐藏
@@ -2458,8 +2483,13 @@
       return;
     }
     const postID = payload.mblogid;
-    if (postID && hasExplicitAdMarker(payload)) {
-      rememberAdPost(postID, describeAdPostOwner(payload));
+    if (postID) {
+      // 卡片正文链接取到的是外层微博的标识，因此转发外层也要登记，用的是原微博
+      // 作者的身份。只登记内层时，转发卡片在 DOM 侧命中不了登记表。
+      const origin = findAdOriginItem(payload);
+      if (hasExplicitAdMarker(origin)) {
+        rememberAdPost(postID, describeAdPostOwner(origin));
+      }
     }
     Object.keys(payload).forEach((key) => {
       if (isUnsafeObjectKey(key)) return;

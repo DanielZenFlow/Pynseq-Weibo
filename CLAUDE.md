@@ -76,7 +76,11 @@ node regression.test.cjs
 
 分档在隐藏判定时计算，不在解析回包时定死。登记表 `AD_POST_OWNERS` 存的是作者身份（`authorID` 与 `following`），`resolveAdPostOwner` 在每次判定时把它解析成分档。自己发布的微博上 `user.following` 就是 `false`，本人判定一旦没有生效，条目只剩 `stranger` 一档可落，而该档默认开启——把分档在解析时定死，这种误判就会固化到下一次重新加载为止。
 
-当前登录 uid 先取页面全局 `$CONFIG`（`user.idstr` 或 `uid`）；读不到时从导航栏中指向当前账号主页的链接读取，uid 形态经 `/^\d{4,}$/` 校验。两处都读不到时返回空串，此时不会产生 `self` 分档。转发按外层微博的作者归类。`user.following` 缺失时归入 `following`，用户关闭该档时无法判定关系的条目保持显示。
+当前登录 uid 先取页面全局 `$CONFIG`（`user.idstr` 或 `uid`）；读不到时从导航栏中指向当前账号主页的链接读取，uid 形态经 `/^\d{4,}$/` 校验。两处都读不到时返回空串，此时不会产生 `self` 分档。`user.following` 缺失时归入 `following`，用户关闭该档时无法判定关系的条目保持显示。
+
+转发按**原微博**的作者归档，取转发链上最内层带广告标记的那一条（`findAdOriginItem`）。转发者只是把同一条广告再发一次，用户关心的是广告作者与自己的关系：转发已关注博主的广告归入 `following`。按外层作者归档会同时错两次——既不受 `hideAdsFromFollowing` 管辖，又因为自己的微博上 `user.following` 为 `false` 而落进 `stranger`。自己出钱推广自己的转发时，广告标记只落在外层，归档因此回到外层作者，`self` 仍然管辖这种情形。
+
+转发的外层与内层都写入登记表，用的是同一个原微博作者身份。卡片正文链接取到的是外层微博的标识，只登记内层时转发卡片在 DOM 侧命中不了登记表。
 
 `hideAds` 是总开关，关闭时三档均不生效。三档的开关变更经 `applyRuntimeConfig` 走完整的恢复与重扫流程。
 
