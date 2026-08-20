@@ -667,8 +667,8 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+2\.4\.51/);
-assert.match(source, /const SCRIPT_VERSION = '2\.4\.51'/);
+assert.match(source, /@version\s+2\.4\.52/);
+assert.match(source, /const SCRIPT_VERSION = '2\.4\.52'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
@@ -2366,7 +2366,75 @@ const recycledAdSource = sourceBetween(
   '  function restoreRecycledVirtualAdShells(scope) {',
   '  function restoreRecycledVirtualContentShells('
 );
-assert.match(recycledAdSource, /node\.closest\(VIRTUAL_VIEW_SELECTOR\)/);
+// 复核不能限定在虚拟列表内。搜索页与正文页的广告卡片不在虚拟行里，限定之后
+// 这些条目的隐藏状态永远不会被重新核对：分档设置改成不隐藏，已经隐藏的条目
+// 也无法恢复。
+assert.doesNotMatch(recycledAdSource, /node\.closest\(VIRTUAL_VIEW_SELECTOR\)/);
+// 复核必须覆盖整篇文档。DOM 变更回调交来的常常是新插入的子树，按该子树复核
+// 时，设置变更之前就已经隐藏的条目不在范围内，隐藏状态会一直保留到下一次
+// 恰好把它包含进来的刷新为止。
+assert.match(
+  sourceBetween(
+    '  function hideBlockedDOMPosts(',
+    '  function queueBlockedDOMRefresh('
+  ),
+  /restoreRecycledVirtualContentShells\(document\);/
+);
+// 行为验证：分档设置改成不隐藏之后，已经带标记且不在虚拟行内的条目必须恢复。
+class FakeAdNode {
+  constructor({ inVirtualRow = false, stillAd = false } = {}) {
+    this.inVirtualRow = inVirtualRow;
+    this.stillAd = stillAd;
+    this.attrs = new Set(['hidden-ad']);
+  }
+  matches(selector) {
+    return selector === '[hidden-ad]' && this.attrs.has('hidden-ad');
+  }
+  closest(selector) {
+    return selector === 'virtual-view' && this.inVirtualRow ? {} : null;
+  }
+  removeAttribute(name) {
+    this.attrs.delete(name);
+  }
+}
+const adRestoreNodes = [
+  new FakeAdNode({ inVirtualRow: true }),
+  new FakeAdNode({ inVirtualRow: false }),
+  new FakeAdNode({ inVirtualRow: false, stillAd: true }),
+];
+const adRemeasured = [];
+const adRestoreContext = vm.createContext({
+  Element: FakeAdNode,
+  HIDDEN_AD_SELECTOR: '[hidden-ad]',
+  HIDDEN_AD_ATTR: 'hidden-ad',
+  VIRTUAL_VIEW_SELECTOR: 'virtual-view',
+  stillLooksLikeRecognizedAd: (node) => node.stillAd,
+  requestNativeVirtualItemRemeasure: (node) => adRemeasured.push(node),
+});
+vm.runInContext(
+  `${recycledAdSource}
+   this.restoreRecycledVirtualAdShells = restoreRecycledVirtualAdShells;`,
+  adRestoreContext
+);
+adRestoreContext.restoreRecycledVirtualAdShells({
+  querySelectorAll: () => adRestoreNodes,
+});
+assert.equal(
+  adRestoreNodes[0].attrs.has('hidden-ad'),
+  false,
+  'a hidden ad inside a virtual row must be revalidated'
+);
+assert.equal(
+  adRestoreNodes[1].attrs.has('hidden-ad'),
+  false,
+  'a hidden ad outside any virtual row must be revalidated too'
+);
+assert.equal(
+  adRestoreNodes[2].attrs.has('hidden-ad'),
+  true,
+  'a node that still qualifies as an ad stays hidden'
+);
+assert.equal(adRemeasured.length, 2);
 assert.match(
   recycledAdSource,
   /if \(!stillLooksLikeRecognizedAd\(node\)\)[\s\S]*?node\.removeAttribute\(HIDDEN_AD_ATTR\)/
