@@ -667,8 +667,8 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+2\.4\.4/);
-assert.match(source, /const SCRIPT_VERSION = '2\.4\.4'/);
+assert.match(source, /@version\s+2\.4\.5/);
+assert.match(source, /const SCRIPT_VERSION = '2\.4\.5'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
@@ -1990,10 +1990,14 @@ assert.ok(
   reconcileBudgetMs >= 15000,
   'reconcile budget must clear the observed 3–4s tab mount plus slow-load margin'
 );
-// 终止条件是路由已离开根路由，不是分栏带上了选中类名。类名与路由由页面框架
-// 分别更新，存在类名已指向「最新微博」而内容仍是「全部关注」的中间态，按类名
-// 判断会把这种状态读成"已经到位"并就此收手。
-assert.doesNotMatch(forceLatestTabSource, /isTimelineTabActive/);
+// 到位判定必须同时看路由与选中态，缺一不可。只看路由：改写地址之后微博前端
+// 有时仍按「全部关注」启动，地址是分组路由，而选中态、标题与时间线接口都停在
+// 「全部关注」，按路由判断会误判为已经到位。只看选中态：选中类名与路由由前端
+// 分别更新，存在类名已指向「最新微博」而内容仍是「全部关注」的中间态。
+assert.match(
+  forceLatestTabSource,
+  /const reachedLatestTab = \(\) =>\s*!isHomeRootRoute\(\) &&\s*isTimelineTabActive\(findTimelineTabElement\(LATEST_TITLE\)\)/
+);
 assert.match(forceLatestTabSource, /!isHomeRootRoute\(\)/);
 // 冷启动失败时 pathname 始终是 "/"，旧实现的路由回调按 pathname 是否变化提前
 // 返回，因而没有任何补救路径。
@@ -2916,22 +2920,120 @@ vm.runInContext(
   rewriteContext
 );
 assert.deepEqual(rewriteReplaced, ['/mygroups?gid=110001635218563']);
-assert.equal(
-  rewriteScheduled.has('timeline-tab-reconcile'),
-  false,
-  'a rewritten route is already on the target tab, so no clicking is needed'
-);
+// 改写只是省掉切换动作，不能当作已经到位：微博前端有时仍按「全部关注」启动。
+// 因此改写之后照样开一次会话兜底，由到位判定决定是否需要点击。
+assert.ok(rewriteScheduled.has('timeline-tab-reconcile'));
 assert.ok(rewriteScheduled.has('timeline-tab-rewrite-verify'));
-// 分栏条挂载后核对：链接上的 gid 与地址一致时，撤掉校验计时器且不点击。
+// 分栏条挂载且「最新微博」已选中：记录 gid、撤掉校验计时器、结束会话且不点击。
 rewriteLatestTab.link = {
   getAttribute: (name) =>
     name === 'href' ? '/mygroups?gid=110001635218563' : null,
 };
+rewriteLatestTab.selected = true;
 rewriteMountedTab = rewriteLatestTab;
 rewriteMutationSubs.get('timeline-tab-gid')();
 assert.equal(rewriteScheduled.has('timeline-tab-rewrite-verify'), false);
+rewriteScheduled.get('timeline-tab-reconcile')();
+assert.equal(rewriteScheduled.has('timeline-tab-reconcile'), false);
 assert.equal(rewriteLatestTab.clicks, 0);
 assert.equal(rewriteStore.WB_latest_timeline_gid, '110001635218563');
+
+// 地址已经是分组路由，微博前端却按「全部关注」启动：选中态停在「全部关注」，
+// 时间线接口也不按该分组请求。只看路由会误判为已经到位，此时必须点击切换。
+const bootStore = { WB_latest_timeline_gid: '110001635218563' };
+const bootScheduled = new Map();
+const bootMutationSubs = new Map();
+const bootLocation = {
+  hostname: 'weibo.com',
+  pathname: '/',
+  search: '',
+  origin: 'https://weibo.com',
+  replace() {},
+};
+const bootLatestTab = new FakeTimelineTab('最新微博');
+const bootAllFollowingTab = new FakeTimelineTab('全部关注');
+bootAllFollowingTab.selected = true;
+bootLatestTab.link = {
+  getAttribute: (name) =>
+    name === 'href' ? '/mygroups?gid=110001635218563' : null,
+};
+const bootContext = vm.createContext({
+  WB_INTERNAL: {
+    dom: {
+      schedule(channel, callback) {
+        bootScheduled.set(channel, callback);
+      },
+      cancel(channel) {
+        return bootScheduled.delete(channel);
+      },
+      subscribeRoute() {},
+      subscribeMutations(channel, callback) {
+        bootMutationSubs.set(channel, callback);
+        return () => bootMutationSubs.delete(channel);
+      },
+    },
+  },
+  document: {
+    documentElement: {},
+    visibilityState: 'visible',
+    addEventListener() {},
+    querySelector(selector) {
+      if (selector.includes('最新微博')) return bootLatestTab;
+      if (selector.includes('全部关注')) return bootAllFollowingTab;
+      return null;
+    },
+  },
+  MutationObserver: class {
+    constructor(callback) {
+      this.callback = callback;
+    }
+    observe() {}
+    disconnect() {}
+  },
+  HTMLElement: FakeTimelineTab,
+  Element: FakeTimelineTab,
+  Date: { now: () => 1000000 },
+  location: bootLocation,
+  history: {
+    replaceState(state, title, url) {
+      const [path, search] = String(url).split('?');
+      bootLocation.pathname = path;
+      bootLocation.search = search ? '?' + search : '';
+    },
+  },
+  GM_getValue: (key, fallback) =>
+    key in bootStore ? bootStore[key] : fallback,
+  GM_setValue(key, value) {
+    bootStore[key] = value;
+  },
+  GM_deleteValue(key) {
+    delete bootStore[key];
+  },
+  TIMELINE_TAB_TITLES: [
+    '全部关注',
+    '最新微博',
+    '特别关注',
+    '好友圈',
+    '悄悄关注',
+  ],
+  timelineDefault: { value: true },
+  isTrustedUserEvent: () => true,
+  syncRelationshipPageMode() {},
+});
+vm.runInContext(
+  `${sourceBetween(
+    '  function findTimelineTabElement(title) {',
+    '  WB_INTERNAL.timelineTabs = Object.freeze({'
+  )}
+  ${forceLatestTabSource}`,
+  bootContext
+);
+assert.equal(bootLocation.pathname, '/mygroups');
+assert.equal(
+  bootLatestTab.clicks,
+  1,
+  'a rewritten route that still boots into another tab must be clicked over'
+);
 
 // gid 失效时，改写把页面带到一个打不开的地址。分栏条始终不出现，校验到期后
 // 清掉 gid 并回到根路由，下一次加载没有 gid 可用，自动退回点击纠正。

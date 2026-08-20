@@ -4,7 +4,7 @@
 // @name:zh-CN   Pynseq for Weibo｜屏序·微博
 // @name:en      Pynseq for Weibo｜屏序·微博
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
-// @version      2.4.4
+// @version      2.4.5
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
 // @description:en Restore a chronological Weibo timeline, locally block unwanted users, filter ads, simplify navigation, and manage official Weibo blocklist synchronization.
 // @author       DanielZenFlow
@@ -41,7 +41,7 @@
   const WB_INTERNAL = Object.create(null);
   const THROTTLE_MS = 350; // 新浪微博官方黑名单分页请求间隔（毫秒）
   const SCRIPT_NAME = 'Pynseq for Weibo｜屏序·微博';
-  const SCRIPT_VERSION = '2.4.4';
+  const SCRIPT_VERSION = '2.4.5';
   const GITHUB_URL = 'https://github.com/DanielZenFlow/Pynseq-Weibo';
   const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/danielzenflow';
   const ONBOARDING_DONE_KEY = 'pynseq_for_weibo_onboarding_done_v1';
@@ -1011,8 +1011,19 @@
     // 分别更新，存在类名已指向「最新微博」而内容仍是「全部关注」的中间态，按
     // 类名判断会把这种状态读成"已经到位"并就此收手。
     let session = null;
-    // 一次"落在根路由"只开一次会话；离开根路由后重新落回才会再开一次。
-    let rootVisitHandled = false;
+    let rewroteRootRoute = false;
+    // 一次"落在首页"只开一次会话；换到别的 pathname 之后再回来才会再开一次。
+    let homeArrivalHandled = false;
+    let lastHomePath = '';
+
+    // 会话的目标是「最新微博」处于选中态，且路由已经离开根路由。两个条件缺一
+    // 不可。只看路由：改写地址之后微博前端有时仍按「全部关注」启动，地址是分组
+    // 路由，而选中态、标题与时间线接口都停在「全部关注」，按路由判断会误判为
+    // 已经到位。只看选中态：选中类名与路由由前端分别更新，存在类名已指向
+    // 「最新微博」而内容仍是「全部关注」的中间态。
+    const reachedLatestTab = () =>
+      !isHomeRootRoute() &&
+      isTimelineTabActive(findTimelineTabElement(LATEST_TITLE));
 
     const endReconcile = () => {
       if (!session) return;
@@ -1026,7 +1037,8 @@
       session.tickedAt = Date.now();
       if (
         !timelineDefault.value ||
-        !isHomeRootRoute() ||
+        !isHomeTimelineRoute() ||
+        reachedLatestTab() ||
         userJustChoseAnotherTab() ||
         session.clicks >= RECONCILE_MAX_CLICKS ||
         Date.now() > session.deadline
@@ -1054,10 +1066,13 @@
     const startReconcile = () => {
       if (session) return;
       if (!timelineDefault.value) return;
-      if (!isHomeRootRoute()) return;
+      if (!isHomeTimelineRoute()) return;
+      // 用户自己停在别的分组分栏时不介入：只有停在根路由（等同「全部关注」）
+      // 或刚刚改写过地址，才说明当前应当落在「最新微博」。
+      if (!isHomeRootRoute() && !rewroteRootRoute) return;
       if (userJustChoseAnotherTab()) return;
-      if (rootVisitHandled) return;
-      rootVisitHandled = true;
+      if (homeArrivalHandled) return;
+      homeArrivalHandled = true;
 
       const observer = new MutationObserver(() => {
         if (!session) return;
@@ -1088,8 +1103,6 @@
 
       reconcileTick();
     };
-
-    let rewroteRootRoute = false;
 
     // 脚本运行于 document-start，页面脚本尚未执行。此刻改写地址，效果等同于
     // 页面本来就打开在「最新微博」。
@@ -1133,13 +1146,7 @@
         GM_setValue(LATEST_TIMELINE_GID_KEY, gid);
       }
       if (!rewroteRootRoute) return true;
-      rewroteRootRoute = false;
       WB_INTERNAL.dom.cancel(REWRITE_VERIFY_CHANNEL);
-      // gid 变了的话，改写会把页面带到别的分组，按分栏链接上的真实 gid 切回。
-      if (gid !== readGidFromQuery(location.search)) {
-        const tab = findTimelineTabElement(LATEST_TITLE);
-        if (tab) tab.click();
-      }
       return true;
     };
 
@@ -1162,10 +1169,15 @@
     const handleRouteChange = () => {
       syncRelationshipPageMode();
       watchTimelineTabs();
-      if (!isHomeRootRoute()) {
-        rootVisitHandled = false;
+      if (!isHomeTimelineRoute()) {
+        homeArrivalHandled = false;
+        lastHomePath = '';
         endReconcile();
         return;
+      }
+      if (location.pathname !== lastHomePath) {
+        lastHomePath = location.pathname;
+        homeArrivalHandled = false;
       }
       startReconcile();
     };
