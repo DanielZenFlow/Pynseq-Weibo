@@ -667,8 +667,8 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+2\.4\.2/);
-assert.match(source, /const SCRIPT_VERSION = '2\.4\.2'/);
+assert.match(source, /@version\s+2\.4\.3/);
+assert.match(source, /const SCRIPT_VERSION = '2\.4\.3'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
@@ -1866,10 +1866,6 @@ assert.equal((source.match(/history\.pushState\s*=/g) || []).length, 1);
 assert.equal((source.match(/history\.replaceState\s*=/g) || []).length, 1);
 assert.doesNotMatch(source, /queuedBlockedDOMRefreshTimer/);
 assert.doesNotMatch(source, /queuedPanelRefreshTimer/);
-assert.match(
-  source,
-  /const syncTabUI = \(\) => \{\s*if \(!timelineDefault\.value\) return;/
-);
 
 const forceLatestTabSource = sourceBetween(
   '  (function forceLatestTab() {',
@@ -1881,7 +1877,28 @@ assert.doesNotMatch(
   forceLatestTabSource,
   /getAttribute\('aria-selected'\)\s*!==\s*'true'/
 );
-assert.match(forceLatestTabSource, /!isTimelineTabActive\(btn\)/);
+// 冷启动纠正必须"持续核对到位"，不能"看到分栏就点一次然后收手"。旧实现在
+// 分栏节点首次出现时即 obs.disconnect()，整段观察又在 5 秒后无条件结束；
+// 实测分栏挂载发生在导航之后 3–4 秒，加载稍慢即越过该上限，点击从未发生，
+// 首页停在「全部关注」。
+assert.doesNotMatch(forceLatestTabSource, /obs\.disconnect\(\)/);
+assert.doesNotMatch(forceLatestTabSource, /disconnect\(\),\s*5000/);
+assert.match(forceLatestTabSource, /RECONCILE_MAX_CLICKS = \d+/);
+const reconcileBudgetMs = Number(
+  (forceLatestTabSource.match(/RECONCILE_BUDGET_MS = (\d+)/) || [])[1]
+);
+assert.ok(
+  reconcileBudgetMs >= 15000,
+  'reconcile budget must clear the observed 3–4s tab mount plus slow-load margin'
+);
+// 终止条件是路由已离开根路由，不是分栏带上了选中类名。类名与路由由页面框架
+// 分别更新，存在类名已指向「最新微博」而内容仍是「全部关注」的中间态，按类名
+// 判断会把这种状态读成"已经到位"并就此收手。
+assert.doesNotMatch(forceLatestTabSource, /isTimelineTabActive/);
+assert.match(forceLatestTabSource, /!isHomeRootRoute\(\)/);
+// 冷启动失败时 pathname 始终是 "/"，旧实现的路由回调按 pathname 是否变化提前
+// 返回，因而没有任何补救路径。
+assert.doesNotMatch(forceLatestTabSource, /newPath === currentPath/);
 // 「全部关注」就是主页根路由，所以必须记住用户亲手点过的分栏，
 // 否则路由回调会把人从「全部关注」立刻弹回「最新微博」。
 assert.match(forceLatestTabSource, /userJustChoseAnotherTab\(\)/);
@@ -2587,6 +2604,118 @@ allFollowingTimelineTab.selected = false;
 assert.equal(timelineContext.reconcileTimeline(true, false), true);
 assert.equal(allFollowingTimelineTab.clicks, 1);
 assert.equal(timelineAssignments.length, 0);
+
+// 冷启动纠正的行为验证。分栏由页面框架异步挂载，实测冷启动下「最新微博」节点
+// 出现在导航之后 3058–4213ms（十次采样），加载变慢会更晚。下面按"节点迟到 8
+// 秒"复现旧实现放弃纠正的场景，并覆盖点击未生效时的重试与到位后的收手。
+let reconcileNow = 1000000;
+const reconcileScheduled = new Map();
+const reconcileRoutes = new Map();
+const reconcileLocation = { hostname: 'weibo.com', pathname: '/' };
+const reconcileLatestTab = new FakeTimelineTab('最新微博');
+const reconcileAllFollowingTab = new FakeTimelineTab('全部关注');
+let reconcileMountedTab = null;
+let reconcileClickHandler = null;
+let reconcileObserverDisconnects = 0;
+const reconcileContext = vm.createContext({
+  WB_INTERNAL: {
+    dom: {
+      schedule(channel, callback) {
+        reconcileScheduled.set(channel, callback);
+      },
+      cancel(channel) {
+        return reconcileScheduled.delete(channel);
+      },
+      subscribeRoute(channel, callback) {
+        reconcileRoutes.set(channel, callback);
+      },
+    },
+  },
+  document: {
+    documentElement: {},
+    addEventListener(type, handler) {
+      if (type === 'click') reconcileClickHandler = handler;
+    },
+    querySelector(selector) {
+      if (selector.includes('最新微博')) return reconcileMountedTab;
+      return null;
+    },
+  },
+  MutationObserver: class {
+    constructor(callback) {
+      this.callback = callback;
+    }
+    observe() {}
+    disconnect() {
+      reconcileObserverDisconnects++;
+    }
+  },
+  HTMLElement: FakeTimelineTab,
+  Element: FakeTimelineTab,
+  Date: { now: () => reconcileNow },
+  location: reconcileLocation,
+  TIMELINE_TAB_TITLES: [
+    '全部关注',
+    '最新微博',
+    '特别关注',
+    '好友圈',
+    '悄悄关注',
+  ],
+  timelineDefault: { value: true },
+  isTrustedUserEvent: () => true,
+  syncRelationshipPageMode() {},
+});
+vm.runInContext(
+  `${sourceBetween(
+    '  function findTimelineTabElement(title) {',
+    '  WB_INTERNAL.timelineTabs = Object.freeze({'
+  )}
+  ${forceLatestTabSource}`,
+  reconcileContext
+);
+const runReconcileTick = (advanceMs) => {
+  reconcileNow += advanceMs;
+  const tick = reconcileScheduled.get('timeline-tab-reconcile');
+  if (tick) tick();
+};
+// 会话在分栏尚未挂载时就已排期，且不会在旧实现的 5 秒上限处收手。
+assert.ok(reconcileScheduled.has('timeline-tab-reconcile'));
+assert.equal(reconcileLatestTab.clicks, 0);
+for (let elapsed = 0; elapsed < 8000; elapsed += 250) runReconcileTick(250);
+assert.equal(reconcileLatestTab.clicks, 0);
+assert.ok(
+  reconcileScheduled.has('timeline-tab-reconcile'),
+  'reconcile must still be pending 8s in, well past the removed 5s cutoff'
+);
+// 分栏迟到挂载后仍会被点到。
+reconcileMountedTab = reconcileLatestTab;
+runReconcileTick(250);
+assert.equal(reconcileLatestTab.clicks, 1);
+// 点击未使路由离开根路由时继续重试，这正是选中类名判断会漏掉的中间态。
+runReconcileTick(400);
+assert.equal(reconcileLatestTab.clicks, 2);
+// 巡检自身也以路由为准：即便没有路由事件，检查到已离开根路由同样收手。
+reconcileLocation.pathname = '/mygroups';
+runReconcileTick(400);
+assert.equal(
+  reconcileScheduled.has('timeline-tab-reconcile'),
+  false,
+  'leaving the root route must end the session even without a route event'
+);
+assert.equal(reconcileObserverDisconnects, 1);
+assert.equal(reconcileLatestTab.clicks, 2);
+// 用户亲手点过别的分栏后回到根路由，不得再把人拽走。
+reconcileRoutes.get('timeline-default')();
+reconcileClickHandler({
+  target: Object.assign(new FakeTimelineTab('全部关注'), {
+    closest: () => reconcileAllFollowingTab,
+  }),
+});
+reconcileLocation.pathname = '/';
+reconcileRoutes.get('timeline-default')();
+assert.equal(reconcileScheduled.has('timeline-tab-reconcile'), false);
+assert.equal(reconcileLatestTab.clicks, 2);
+
 const remoteConfigSource = sourceBetween(
   "  if (typeof GM_addValueChangeListener === 'function') {",
   "  if (document.readyState === 'loading')"

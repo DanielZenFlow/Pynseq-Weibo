@@ -4,7 +4,7 @@
 // @name:zh-CN   Pynseq for Weibo｜屏序·微博
 // @name:en      Pynseq for Weibo｜屏序·微博
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
-// @version      2.4.2
+// @version      2.4.3
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
 // @description:en Restore a chronological Weibo timeline, locally block unwanted users, filter ads, simplify navigation, and manage official Weibo blocklist synchronization.
 // @author       DanielZenFlow
@@ -41,7 +41,7 @@
   const WB_INTERNAL = Object.create(null);
   const THROTTLE_MS = 350; // 新浪微博官方黑名单分页请求间隔（毫秒）
   const SCRIPT_NAME = 'Pynseq for Weibo｜屏序·微博';
-  const SCRIPT_VERSION = '2.4.2';
+  const SCRIPT_VERSION = '2.4.3';
   const GITHUB_URL = 'https://github.com/DanielZenFlow/Pynseq-Weibo';
   const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/danielzenflow';
   const ONBOARDING_DONE_KEY = 'pynseq_for_weibo_onboarding_done_v1';
@@ -937,15 +937,20 @@
     let manualTabChoiceTitle = '';
     let manualTabChoiceAt = 0;
 
+    // 一次纠正会话的边界。分栏由页面框架异步挂载，冷启动下分栏节点出现在导航
+    // 之后约 3–4 秒，网络或缓存变慢时更晚，因此时间预算取 20 秒。点击之后若
+    // 路由仍停在根路由则继续重试，重试次数与两次点击的最小间隔一并设限，避免
+    // 分栏长期不可点时空转。
+    const RECONCILE_BUDGET_MS = 20000;
+    const RECONCILE_MAX_CLICKS = 12;
+    const RECONCILE_MIN_CLICK_GAP_MS = 350;
+    const RECONCILE_TICK_MS = 250;
+    const RECONCILE_MIN_TICK_GAP_MS = 50;
+    const RECONCILE_CHANNEL = 'timeline-tab-reconcile';
+
     const isHomeRootRoute = () =>
       ['weibo.com', 'www.weibo.com'].includes(location.hostname) &&
       (location.pathname === '/' || location.pathname === '');
-
-    const isHomeTimelineRoute = () =>
-      ['weibo.com', 'www.weibo.com'].includes(location.hostname) &&
-      (location.pathname === '/' ||
-        location.pathname === '' ||
-        /^\/mygroups(?:\/|$)/.test(location.pathname));
 
     const userJustChoseAnotherTab = () =>
       !!manualTabChoiceTitle &&
@@ -967,56 +972,102 @@
       true
     );
 
-    // DOM层：确保Tab UI状态正确（点击切换）
-    const syncTabUI = () => {
-      if (!timelineDefault.value) return;
-      if (!isHomeTimelineRoute()) return;
-      if (userJustChoseAnotherTab()) return;
-      const btn = findTimelineTabElement(LATEST_TITLE);
-      if (btn && !isTimelineTabActive(btn)) btn.click();
+    // 纠正以"是否仍停在根路由"为准，不以分栏的选中类名为准。根路由就是
+    // 「全部关注」，离开根路由即表示已经进入某个分组分栏——可能是「最新微博」，
+    // 也可能是用户自己挑的分栏，两种情况都不再动它。选中类名与路由由页面框架
+    // 分别更新，存在类名已指向「最新微博」而内容仍是「全部关注」的中间态，按
+    // 类名判断会把这种状态读成"已经到位"并就此收手。
+    let session = null;
+    // 一次"落在根路由"只开一次会话；离开根路由后重新落回才会再开一次。
+    let rootVisitHandled = false;
+
+    const endReconcile = () => {
+      if (!session) return;
+      session.observer.disconnect();
+      session = null;
+      WB_INTERNAL.dom.cancel(RECONCILE_CHANNEL);
     };
 
-    if (isHomeRootRoute() && timelineDefault.value) {
-      // 使用 MutationObserver 监听Tab出现后立即点击（比setTimeout更快）
-      const tabObserver = new MutationObserver((mutations, obs) => {
-        const btn = findTimelineTabElement(LATEST_TITLE);
-        if (!btn) return;
-        obs.disconnect();
-        if (userJustChoseAnotherTab()) return;
-        if (!isTimelineTabActive(btn)) btn.click();
-      });
+    const reconcileTick = () => {
+      if (!session) return;
+      session.tickedAt = Date.now();
+      if (
+        !timelineDefault.value ||
+        !isHomeRootRoute() ||
+        userJustChoseAnotherTab() ||
+        session.clicks >= RECONCILE_MAX_CLICKS ||
+        Date.now() > session.deadline
+      ) {
+        endReconcile();
+        return;
+      }
 
-      // 尽早开始监听
-      const startObserve = () => {
-        tabObserver.observe(document.documentElement, {
+      const btn = findTimelineTabElement(LATEST_TITLE);
+      if (btn && Date.now() - session.clickedAt >= RECONCILE_MIN_CLICK_GAP_MS) {
+        session.clicks += 1;
+        session.clickedAt = Date.now();
+        btn.click();
+      }
+
+      // 点击可能同步触发路由变化并结束会话，重新排期前需要再确认会话仍在。
+      if (!session) return;
+      WB_INTERNAL.dom.schedule(
+        RECONCILE_CHANNEL,
+        reconcileTick,
+        RECONCILE_TICK_MS
+      );
+    };
+
+    const startReconcile = () => {
+      if (session) return;
+      if (!timelineDefault.value) return;
+      if (!isHomeRootRoute()) return;
+      if (userJustChoseAnotherTab()) return;
+      if (rootVisitHandled) return;
+      rootVisitHandled = true;
+
+      const observer = new MutationObserver(() => {
+        if (!session) return;
+        if (Date.now() - session.tickedAt < RECONCILE_MIN_TICK_GAP_MS) return;
+        reconcileTick();
+      });
+      session = {
+        observer,
+        deadline: Date.now() + RECONCILE_BUDGET_MS,
+        clicks: 0,
+        clickedAt: 0,
+        tickedAt: 0,
+      };
+
+      // 分栏挂载会产生子树变更，据此在节点出现的同一刻发起点击；轮询覆盖
+      // "节点早已存在、点击却没有生效"这类不再产生新变更的情况。
+      const observe = () => {
+        if (!session) return;
+        observer.observe(document.documentElement, {
           childList: true,
           subtree: true,
         });
-        // 5秒后自动停止，防止无限监听
-        setTimeout(() => tabObserver.disconnect(), 5000);
       };
-
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', startObserve);
-      } else {
-        startObserve();
+      if (document.documentElement) observe();
+      else {
+        document.addEventListener('DOMContentLoaded', observe, { once: true });
       }
-    }
 
-    // SPA路由变化时同步Tab状态
-    let currentPath = location.pathname;
+      reconcileTick();
+    };
+
     const handleRouteChange = () => {
       syncRelationshipPageMode();
-      const newPath = location.pathname;
-      if (newPath === currentPath) return;
-      currentPath = newPath;
-      if (!isHomeRootRoute()) return;
-
-      WB_INTERNAL.dom.schedule('timeline-tab-primary', syncTabUI, 100);
-      WB_INTERNAL.dom.schedule('timeline-tab-followup', syncTabUI, 450);
+      if (!isHomeRootRoute()) {
+        rootVisitHandled = false;
+        endReconcile();
+        return;
+      }
+      startReconcile();
     };
 
     WB_INTERNAL.dom.subscribeRoute('timeline-default', handleRouteChange);
+    startReconcile();
   })();
 
   // === 本地屏蔽列表与新浪微博官方黑名单同步 ===
