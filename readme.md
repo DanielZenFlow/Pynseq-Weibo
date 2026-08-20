@@ -15,6 +15,7 @@
 - 支持分别控制微博与转发、评论与回复、搜索结果、用户卡片与推荐项、互动列表五类屏蔽范围。
 - 支持独立隐藏时间线中的“你可能感兴趣的内容”、带 isAd 标记的广告微博、搜索页相关用户、微博热搜及多个导航和侧栏模块。
 - 带 isAd 标记的广告按作者与当前账号的关系分为三档，可分别开关：关注博主发布的广告（默认隐藏）、非关注博主发布的广告（默认隐藏）、本人发布的广告（默认保留）。关注博主发布的商业推广同样带有该标记。
+- 转发的广告按原微博的作者归档。转发已关注博主的广告归入「关注博主发布的广告」，不因转发者是当前账号而落入「本人发布的广告」。使用粉丝头条推广自己的转发时，广告标记只落在转发本身，仍归入「本人发布的广告」。
 - 提供五步首次设置向导、右下角快捷设置按钮，以及 Tampermonkey「设置」「关于」菜单。
 - 支持搜索、分页、手动添加、移除、清空、导入和导出本地屏蔽名单。
 - 支持增量同步、同步前五页和完整同步新浪微博官方黑名单。
@@ -118,6 +119,8 @@
 - Adds a context menu to identifiable usernames for local blocking or optional simultaneous addition to Weibo's official blocklist.
 - Provides separate filtering controls for posts and reposts, comments and replies, search results, user cards and recommendations, and interaction lists.
 - Independently hides “You may be interested” timeline recommendations, identifiable ads and promotions, related-user panels, trending topics, and selected navigation or sidebar modules.
+- Groups isAd-marked posts into three tiers by the author's relationship to the current account, each with its own switch: ads from followed accounts (hidden by default), ads from accounts you do not follow (hidden by default), and ads you posted yourself (kept by default).
+- Classifies a repost by the author of the original post. A repost of an ad from an account you follow belongs to the followed-account tier rather than the self tier. When you promote your own repost, the ad marker sits on the repost itself and it stays in the self tier.
 - Includes a five-step onboarding flow, a quick-settings button, and “Settings” and “About” Tampermonkey menu entries.
 - Supports searching, pagination, manual entry, removal, clearing, importing, and exporting of the local blocklist.
 - Synchronizes the first page, first five pages, or all readable pages of Weibo's official blocklist.
