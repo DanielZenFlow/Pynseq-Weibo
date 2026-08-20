@@ -667,8 +667,8 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+2\.4\.5/);
-assert.match(source, /const SCRIPT_VERSION = '2\.4\.5'/);
+assert.match(source, /@version\s+2\.4\.51/);
+assert.match(source, /const SCRIPT_VERSION = '2\.4\.51'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
