@@ -4,7 +4,7 @@
 // @name:zh-CN   Pynseq for Weibo｜屏序·微博｜本地屏蔽名单与时间线控制｜屏蔽热搜
 // @name:en      Pynseq for Weibo｜屏序·微博｜本地屏蔽名单与时间线控制｜屏蔽热搜
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
-// @version      2.4.52
+// @version      2.4.53
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
 // @description:en Restore a chronological Weibo timeline, locally block unwanted users, filter ads, simplify navigation, and manage official Weibo blocklist synchronization.
 // @author       DanielZenFlow
@@ -41,7 +41,7 @@
   const WB_INTERNAL = Object.create(null);
   const THROTTLE_MS = 350; // 新浪微博官方黑名单分页请求间隔（毫秒）
   const SCRIPT_NAME = 'Pynseq for Weibo｜屏序·微博';
-  const SCRIPT_VERSION = '2.4.52';
+  const SCRIPT_VERSION = '2.4.53';
   const GITHUB_URL = 'https://github.com/DanielZenFlow/Pynseq-Weibo';
   const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/danielzenflow';
   const ONBOARDING_DONE_KEY = 'pynseq_for_weibo_onboarding_done_v1';
@@ -2346,29 +2346,77 @@
   // 当前登录用户 uid 用于区分「自己发布的广告」。微博把它写在页面全局 $CONFIG 上，
   // 脚本只读取该值；读不到时按未知处理，条目落入关注或非关注两类。
   let currentUserIDCache = '';
+
+  // 导航栏里指向当前账号主页的链接。页面全局 $CONFIG 读不到时（脚本管理器把
+  // 脚本放进隔离环境就会这样），这是页面上另一处能确定当前账号的地方。
+  const CURRENT_USER_NAV_SELECTOR = [
+    'nav a[href*="/u/"]',
+    'header a[href*="/u/"]',
+    '[class*="Nav"] a[href*="/u/"]',
+    '[class*="nav"] a[href*="/u/"]',
+  ].join(',');
+
+  function readCurrentUserIDFromDOM() {
+    if (typeof document === 'undefined' || !document.querySelectorAll) return '';
+    let anchors;
+    try {
+      anchors = document.querySelectorAll(CURRENT_USER_NAV_SELECTOR);
+    } catch {
+      return '';
+    }
+    for (const anchor of anchors) {
+      const href = String(anchor.getAttribute?.('href') || '');
+      const matched = /\/u\/(\d{4,})(?:[/?#]|$)/.exec(
+        href.replace(/^(?:https?:)?\/\/[^/]+/i, '')
+      );
+      if (matched) return matched[1];
+    }
+    return '';
+  }
+
   function getCurrentUserID() {
     if (currentUserIDCache) return currentUserIDCache;
     try {
       const pageConfig = window.$CONFIG;
-      if (!pageConfig || typeof pageConfig !== 'object') return '';
-      const raw = pageConfig.user?.idstr ?? pageConfig.uid;
+      const raw =
+        pageConfig && typeof pageConfig === 'object'
+          ? pageConfig.user?.idstr ?? pageConfig.uid
+          : undefined;
       const id = String(raw ?? '').trim();
       if (/^\d{4,}$/.test(id)) currentUserIDCache = id;
     } catch {
-      /* 页面全局不可读时保持未知 */
+      /* 页面全局不可读时继续走 DOM 兜底 */
     }
+    if (!currentUserIDCache) currentUserIDCache = readCurrentUserIDFromDOM();
     return currentUserIDCache;
+  }
+
+  // 登记表存作者身份，不存分档结果。当前登录 uid 可能晚于回包才可读，把分档在
+  // 解析回包时定死，本人发布的广告会被记成「非关注博主」——自己的微博上
+  // user.following 就是 false，一旦本人判定没生效就只剩这一档可落。分档改到隐藏
+  // 判定时计算，身份晚一步可读也能自行纠正。
+  function describeAdPostOwner(item) {
+    const user = item && typeof item === 'object' ? item.user : null;
+    return {
+      authorID: String(user?.idstr ?? user?.id ?? '').trim(),
+      following: user ? user.following : undefined,
+    };
   }
 
   // 广告微博按作者与当前用户的关系分成三类，分别对应三个设置项。转发按外层微博的
   // 作者归类。user.following 缺失时归入「关注博主」：用户关闭该档时，无法判定关系
   // 的条目保持显示。
   function classifyAdPostOwner(item) {
-    const user = item && typeof item === 'object' ? item.user : null;
-    const authorID = String(user?.idstr ?? user?.id ?? '').trim();
+    return resolveAdPostOwner(describeAdPostOwner(item));
+  }
+
+  function resolveAdPostOwner(entry) {
+    if (!entry || typeof entry !== 'object') return AD_OWNER_FOLLOWING;
     const selfID = getCurrentUserID();
-    if (selfID && authorID && authorID === selfID) return AD_OWNER_SELF;
-    if (user && user.following === false) return AD_OWNER_STRANGER;
+    if (selfID && entry.authorID && entry.authorID === selfID) {
+      return AD_OWNER_SELF;
+    }
+    if (entry.following === false) return AD_OWNER_STRANGER;
     return AD_OWNER_FOLLOWING;
   }
 
@@ -2398,7 +2446,7 @@
 
   function getAdPostOwner(id) {
     const key = String(id || '').trim();
-    return key ? AD_POST_OWNERS.get(key) || '' : '';
+    return (key && AD_POST_OWNERS.get(key)) || null;
   }
 
   function collectAdPosts(payload, depth = 0) {
@@ -2411,7 +2459,7 @@
     }
     const postID = payload.mblogid;
     if (postID && hasExplicitAdMarker(payload)) {
-      rememberAdPost(postID, classifyAdPostOwner(payload));
+      rememberAdPost(postID, describeAdPostOwner(payload));
     }
     Object.keys(payload).forEach((key) => {
       if (isUnsafeObjectKey(key)) return;
@@ -4647,8 +4695,8 @@
 
   function isRegisteredAdPostRoot(root) {
     if (!(root instanceof Element) || !AD_POST_OWNERS.size) return false;
-    const owner = getAdPostOwner(extractPostIDFromRoot(root));
-    return !!owner && isHiddenAdOwner(owner);
+    const entry = getAdPostOwner(extractPostIDFromRoot(root));
+    return !!entry && isHiddenAdOwner(resolveAdPostOwner(entry));
   }
 
   function hideRecognizedAds(root = document) {

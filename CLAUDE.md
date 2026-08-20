@@ -74,7 +74,9 @@ node regression.test.cjs
 | `stranger` | `user.following === false` | 隐藏 |
 | `following` | 其余情况，含 `user.following` 缺失 | 隐藏 |
 
-当前登录 uid 取自页面全局 `$CONFIG`（`user.idstr` 或 `uid`），读取失败时返回空串，此时不会产生 `self` 分档。转发按外层微博的作者归类。`user.following` 缺失时归入 `following`，用户关闭该档时无法判定关系的条目保持显示。
+分档在隐藏判定时计算，不在解析回包时定死。登记表 `AD_POST_OWNERS` 存的是作者身份（`authorID` 与 `following`），`resolveAdPostOwner` 在每次判定时把它解析成分档。自己发布的微博上 `user.following` 就是 `false`，本人判定一旦没有生效，条目只剩 `stranger` 一档可落，而该档默认开启——把分档在解析时定死，这种误判就会固化到下一次重新加载为止。
+
+当前登录 uid 先取页面全局 `$CONFIG`（`user.idstr` 或 `uid`）；读不到时从导航栏中指向当前账号主页的链接读取，uid 形态经 `/^\d{4,}$/` 校验。两处都读不到时返回空串，此时不会产生 `self` 分档。转发按外层微博的作者归类。`user.following` 缺失时归入 `following`，用户关闭该档时无法判定关系的条目保持显示。
 
 `hideAds` 是总开关，关闭时三档均不生效。三档的开关变更经 `applyRuntimeConfig` 走完整的恢复与重扫流程。
 

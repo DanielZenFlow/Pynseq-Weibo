@@ -667,8 +667,8 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+2\.4\.52/);
-assert.match(source, /const SCRIPT_VERSION = '2\.4\.52'/);
+assert.match(source, /@version\s+2\.4\.53/);
+assert.match(source, /const SCRIPT_VERSION = '2\.4\.53'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
@@ -3362,6 +3362,9 @@ vm.runInContext(
     getAdPostOwner,
     collectAdPosts,
     classifyAdPostOwner,
+    resolveAdPostOwner,
+    describeAdPostOwner,
+    readCurrentUserIDFromDOM,
     isHiddenAdOwner,
     getCurrentUserID,
     observeContentResponse,
@@ -3458,14 +3461,72 @@ adAPI.collectAdPosts({
     },
   ],
 });
-assert.equal(adAPI.getAdPostOwner('SelfAd01'), 'self');
-assert.equal(adAPI.getAdPostOwner('FollowAd'), 'following');
-assert.equal(adAPI.getAdPostOwner('StrangeA'), 'stranger');
+// 登记表存作者身份，分档在隐藏判定时解析。
+assert.equal(
+  adAPI.resolveAdPostOwner(adAPI.getAdPostOwner('SelfAd01')),
+  'self'
+);
+assert.equal(
+  adAPI.resolveAdPostOwner(adAPI.getAdPostOwner('FollowAd')),
+  'following'
+);
+assert.equal(
+  adAPI.resolveAdPostOwner(adAPI.getAdPostOwner('StrangeA')),
+  'stranger'
+);
+// 本人发布的微博上 user.following 就是 false。当前登录 uid 在解析回包时还读不到
+// 的话，按当时的信息只能落到「非关注博主」——这一档默认开启，本人发布的推广
+// 就被隐藏了。分档必须留到隐藏判定时再算，那时身份已经可读。
+const lateSelfEntry = adAPI.describeAdPostOwner({
+  user: { idstr: '1635218563', following: false },
+});
+assert.equal(lateSelfEntry.authorID, '1635218563');
+assert.equal(lateSelfEntry.following, false);
+assert.equal(adAPI.resolveAdPostOwner(lateSelfEntry), 'self');
+// 身份读不到时，同一条目退回「非关注博主」；这正是必须延后解析的原因。
+const savedConfig = adContext.window.$CONFIG;
+const savedCache = adAPI.getCurrentUserID();
+adContext.window.$CONFIG = undefined;
+adContext.document.querySelectorAll = () => [];
+assert.equal(
+  adAPI.resolveAdPostOwner({ authorID: '1635218563', following: false }),
+  savedCache ? 'self' : 'stranger'
+);
+adContext.window.$CONFIG = savedConfig;
+delete adContext.document.querySelectorAll;
+// 隐藏判定必须现算分档，不能直接拿登记值当分档用。
+assert.match(
+  sourceBetween(
+    '  function isRegisteredAdPostRoot(root) {',
+    '  function hideRecognizedAds('
+  ),
+  /isHiddenAdOwner\(resolveAdPostOwner\(entry\)\)/
+);
+// $CONFIG 读不到时（脚本管理器把脚本放进隔离环境就会这样），本人判定必须还有
+// 一条来源，否则本人发布的推广会一直落到「非关注博主」这一档。
+assert.match(
+  sourceBetween(
+    '  function getCurrentUserID() {',
+    '  // 登记表存作者身份，不存分档结果。'
+  ),
+  /currentUserIDCache = readCurrentUserIDFromDOM\(\)/
+);
+adContext.document.querySelectorAll = (selector) =>
+  /a\[href\*="\/u\/"\]/.test(selector)
+    ? [
+        { getAttribute: () => '/u/pageentry' },
+        { getAttribute: () => 'https://weibo.com/u/1635218563' },
+      ]
+    : [];
+assert.equal(adAPI.readCurrentUserIDFromDOM(), '1635218563');
+adContext.document.querySelectorAll = () => [];
+assert.equal(adAPI.readCurrentUserIDFromDOM(), '');
+delete adContext.document.querySelectorAll;
 
 // 时间线可无限翻页，登记表必须有界并淘汰最早写入的条目。
 adAPI.AD_POST_OWNERS.clear();
 for (let i = 0; i < adAPI.AD_POST_ID_LIMIT + 5; i += 1) {
-  adAPI.rememberAdPost(`id${i}`, 'following');
+  adAPI.rememberAdPost(`id${i}`, { authorID: '', following: true });
 }
 assert.equal(adAPI.AD_POST_OWNERS.size, adAPI.AD_POST_ID_LIMIT);
 assert.equal(!!adAPI.getAdPostOwner('id0'), false);
