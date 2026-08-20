@@ -1,8 +1,8 @@
 ﻿// ==UserScript==
 // @sandbox      raw
-// @name         Pynseq for Weibo｜屏序·微博
-// @name:zh-CN   Pynseq for Weibo｜屏序·微博
-// @name:en      Pynseq for Weibo｜屏序·微博
+// @name         Pynseq for Weibo｜屏序·微博｜本地屏蔽名单与时间线控制｜屏蔽热搜
+// @name:zh-CN   Pynseq for Weibo｜屏序·微博｜本地屏蔽名单与时间线控制｜屏蔽热搜
+// @name:en      Pynseq for Weibo｜屏序·微博｜本地屏蔽名单与时间线控制｜屏蔽热搜
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
 // @version      2.4.51
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
