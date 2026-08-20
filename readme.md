@@ -84,7 +84,7 @@
 
 - 过滤依赖微博网页当前提供的用户标识、接口数据和页面结构；微博更新页面后，部分功能可能需要适配。
 - 页面尚未加载完成或没有提供可识别 UID 时，相关内容可能需要等待数据加载后才能被过滤。
-- 「最新微博」不是微博首页的根路由，切换在分栏渲染完成之后进行；打开首页时会先出现「全部关注」，随后切换到「最新微博」。
+- 「最新微博」不是微博首页的根路由。脚本记录该分栏的地址之后，打开首页直接进入该分栏；首次使用时仍需等分栏渲染完成后再切换。
 - 微博使用动态加载和虚拟列表，脚本只能处理当前浏览器已经接收并能够识别的内容。
 - 本地屏蔽不等同于新浪微博官方拉黑；只有明确选择官方黑名单操作时，才会修改微博账户中的官方黑名单。
 - 官方黑名单同步受微博接口状态、分页数据和访问频率限制。
@@ -181,7 +181,7 @@ Export the blocklist under “Settings → Local Blocklist”. The exported JSON
 
 - Filtering depends on user identifiers, API data, and page structures exposed by the current Weibo website. Some features may require updates after Weibo changes its interface.
 - Content may remain visible until identity data becomes available when a page has not finished loading or does not expose an identifiable UID.
-- “Latest Weibo” is not the Weibo home root route, so the switch happens after the feed tabs render. Opening the home page shows “All Following” first and then switches to “Latest Weibo”.
+- “Latest Weibo” is not the Weibo home root route. Once the script has recorded that tab’s address, the home page opens there directly; the first visit still switches after the feed tabs render.
 - Weibo uses dynamic loading and virtualized lists. The script can only process content received and identified by the current browser.
 - Local blocking is not the same as Weibo's official blocking feature. The official account blocklist changes only when the corresponding action is explicitly selected.
 - Official blocklist synchronization depends on Weibo endpoint availability, pagination data, and rate limits.

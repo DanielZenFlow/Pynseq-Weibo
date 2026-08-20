@@ -82,7 +82,11 @@ node regression.test.cjs
 
 「全部关注」就是主页根路由 `/`，其余分栏是 `/mygroups?gid=...`。开启「主页默认显示「最新微博」」后，脚本需要点击分栏才能离开「全部关注」，接口层不做任何拦截。
 
-分栏由微博前端异步挂载，冷启动下节点出现在导航之后约 3–4 秒，加载变慢时更晚。纠正因此按会话进行，不做一次性尝试：
+开启该设置后有两条路径。
+
+**地址改写（默认路径）。** 脚本从「最新微博」分栏所在的链接上读取 gid，写入 `WB_latest_timeline_gid`，读取不发起请求。之后打开首页时，脚本在 document-start 阶段把根路由 `history.replaceState` 成 `/mygroups?gid=...`。此时页面脚本尚未执行，微博前端初始化路由时读到的就是「最新微博」，不会请求「全部关注」的内容。改写之后分栏条在 20 秒内仍未出现时，说明记录的 gid 已不可用，脚本清除它并回到根路由，下一次加载退回点击纠正；页面不可见时只推迟判定。
+
+**点击纠正（首次使用与兜底）。** 没有记录到 gid 时，页面停在根路由，脚本点击分栏切换过去。分栏由微博前端异步挂载，冷启动下节点出现在导航之后 1.0–2.1 秒，加载变慢时更晚。纠正因此按会话进行，不做一次性尝试：
 
 - 落在根路由时开启一次会话，时间预算 20 秒，其间持续等待分栏节点出现。
 - 分栏节点出现即点击。点击后路由仍停在根路由则重试，最多 12 次，两次点击间隔不短于 350ms。
@@ -98,3 +102,13 @@ node regression.test.cjs
 微博时间线使用 `vue-virtual-scroller`。隐藏条目时不改动外层 item-view 的 transform 与高度，只把内容壳压成 2px 的不可见测量壳——`DynamicScroller` 会忽略恰好为 0 的测量值并沿用旧行高。
 
 隐藏与恢复后都必须调用 `requestNativeVirtualItemRemeasure`，向 `DynamicScrollerItem` 发送局部 `resize` 通知。壳被回收给另一条微博时，需重新核对隐藏条件是否仍然成立，否则复用后的正常微博会继续沿用上一条的隐藏状态。
+
+微博正文页的评论区使用同一套虚拟列表，但隐藏目标位于行内第三层：`item-view > wbpro-scroller-item > wbpro-list > 评论项`。`requestNativeVirtualItemRemeasure` 按 `closest` 定位所在的虚拟行，不能按父节点匹配，否则评论区取不到行，重测通知不会发出。
+
+行内的内容全部隐藏时，行本身测得 0，滚动器沿用旧行高，原位置留下整段空白，并且不会因为出现空位而补足可视区内的条目——整屏评论都被屏蔽时，评论区会既是空白又不再加载后续评论。`syncVirtualRowMeasurementShell` 在这种情况下给行内的直接内容壳加上 `VIRTUAL_ROW_SHELL_ATTR`，由样式保留 2px 的不可见测量壳。该标记必须在每轮过滤时经 `syncVirtualRowMeasurementShells` 重新核对，因为 Vue 会把同一行复用给另一条内容。
+
+## 评论过滤
+
+微博侧的 `hideBlockedDOMPosts` 与评论侧的 `hideBlockedCommentRoots` 使用各自的根定位逻辑，前者不覆盖后者。两者必须成对执行：定时刷新走 `refreshBlockedContent`，屏蔽动作在 `hideBlacklistComments` 开启时无条件执行一次评论侧隐藏。
+
+子评论不匹配 `DOM_COMMENT_ROOT_SELECTOR`，`findContentRootForUID` 取到的节点也不会被 `isCommentContentRoot` 认出来。按该节点的形态在评论与微博两条路径之间二选一时，屏蔽子评论两条都不覆盖，要等评论区下一次重新渲染才生效。

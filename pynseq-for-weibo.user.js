@@ -4,7 +4,7 @@
 // @name:zh-CN   Pynseq for Weibo｜屏序·微博
 // @name:en      Pynseq for Weibo｜屏序·微博
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
-// @version      2.4.3
+// @version      2.4.4
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
 // @description:en Restore a chronological Weibo timeline, locally block unwanted users, filter ads, simplify navigation, and manage official Weibo blocklist synchronization.
 // @author       DanielZenFlow
@@ -41,7 +41,7 @@
   const WB_INTERNAL = Object.create(null);
   const THROTTLE_MS = 350; // 新浪微博官方黑名单分页请求间隔（毫秒）
   const SCRIPT_NAME = 'Pynseq for Weibo｜屏序·微博';
-  const SCRIPT_VERSION = '2.4.3';
+  const SCRIPT_VERSION = '2.4.4';
   const GITHUB_URL = 'https://github.com/DanielZenFlow/Pynseq-Weibo';
   const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/danielzenflow';
   const ONBOARDING_DONE_KEY = 'pynseq_for_weibo_onboarding_done_v1';
@@ -948,9 +948,42 @@
     const RECONCILE_MIN_TICK_GAP_MS = 50;
     const RECONCILE_CHANNEL = 'timeline-tab-reconcile';
 
+    // 「最新微博」不是主页根路由，它是 /mygroups?gid=...。记住这个 gid 之后，
+    // 脚本在微博前端启动之前把地址改写过去，前端初始化路由时读到的就是
+    // 「最新微博」，不再请求「全部关注」的内容，页面也就不存在先渲染一个分栏
+    // 再切换到另一个分栏的过程。
+    const LATEST_TIMELINE_GID_KEY = 'WB_latest_timeline_gid';
+    const REWRITE_VERIFY_CHANNEL = 'timeline-tab-rewrite-verify';
+    // 改写之后分栏条迟迟不出现，说明存下来的 gid 已经不可用。
+    const REWRITE_VERIFY_MS = 20000;
+
     const isHomeRootRoute = () =>
       ['weibo.com', 'www.weibo.com'].includes(location.hostname) &&
       (location.pathname === '/' || location.pathname === '');
+
+    const isHomeTimelineRoute = () =>
+      ['weibo.com', 'www.weibo.com'].includes(location.hostname) &&
+      (location.pathname === '/' ||
+        location.pathname === '' ||
+        location.pathname === '/mygroups' ||
+        location.pathname.indexOf('/mygroups/') === 0);
+
+    const readGidFromQuery = (search) => {
+      const matched = String(search || '').match(/[?&]gid=([0-9]+)/);
+      return matched ? matched[1] : '';
+    };
+
+    const readStoredLatestGid = () => {
+      const stored = String(GM_getValue(LATEST_TIMELINE_GID_KEY, '') || '');
+      return /^[0-9]{5,}$/.test(stored) ? stored : '';
+    };
+
+    // 分栏节点本身是 div，gid 写在包着它的链接上。读取不产生任何请求。
+    const readLatestGidFromDom = () => {
+      const tab = findTimelineTabElement(LATEST_TITLE);
+      const link = tab && tab.closest('a[href*="gid="]');
+      return link ? readGidFromQuery(link.getAttribute('href')) : '';
+    };
 
     const userJustChoseAnotherTab = () =>
       !!manualTabChoiceTitle &&
@@ -1056,8 +1089,79 @@
       reconcileTick();
     };
 
+    let rewroteRootRoute = false;
+
+    // 脚本运行于 document-start，页面脚本尚未执行。此刻改写地址，效果等同于
+    // 页面本来就打开在「最新微博」。
+    const rewriteRootRouteToLatest = () => {
+      if (!timelineDefault.value) return;
+      if (!isHomeRootRoute()) return;
+      const gid = readStoredLatestGid();
+      if (!gid) return;
+      history.replaceState(null, '', `/mygroups?gid=${gid}`);
+      rewroteRootRoute = true;
+      WB_INTERNAL.dom.schedule(
+        REWRITE_VERIFY_CHANNEL,
+        verifyRewrittenRoute,
+        REWRITE_VERIFY_MS
+      );
+    };
+
+    // 分栏条始终没有出现时，清掉 gid 并回到根路由。下一次加载没有 gid 可用，
+    // 自动退回点击纠正。页面不可见时只是渲染被推迟，重新排期而不是判定失败。
+    function verifyRewrittenRoute() {
+      if (!rewroteRootRoute) return;
+      if (readLatestGidFromDom()) return;
+      if (document.visibilityState !== 'visible') {
+        WB_INTERNAL.dom.schedule(
+          REWRITE_VERIFY_CHANNEL,
+          verifyRewrittenRoute,
+          REWRITE_VERIFY_MS
+        );
+        return;
+      }
+      rewroteRootRoute = false;
+      GM_deleteValue(LATEST_TIMELINE_GID_KEY);
+      location.replace(`${location.origin}/`);
+    }
+
+    // 分栏条挂载后记录 gid，并核对改写用的 gid 是否仍指向「最新微博」。
+    const reviewTimelineTabs = () => {
+      const gid = readLatestGidFromDom();
+      if (!gid) return false;
+      if (gid !== readStoredLatestGid()) {
+        GM_setValue(LATEST_TIMELINE_GID_KEY, gid);
+      }
+      if (!rewroteRootRoute) return true;
+      rewroteRootRoute = false;
+      WB_INTERNAL.dom.cancel(REWRITE_VERIFY_CHANNEL);
+      // gid 变了的话，改写会把页面带到别的分组，按分栏链接上的真实 gid 切回。
+      if (gid !== readGidFromQuery(location.search)) {
+        const tab = findTimelineTabElement(LATEST_TITLE);
+        if (tab) tab.click();
+      }
+      return true;
+    };
+
+    let gidWatchStop = null;
+    const watchTimelineTabs = () => {
+      if (gidWatchStop) return;
+      if (!isHomeTimelineRoute()) return;
+      if (reviewTimelineTabs()) return;
+      gidWatchStop = WB_INTERNAL.dom.subscribeMutations(
+        'timeline-tab-gid',
+        () => {
+          if (!reviewTimelineTabs()) return;
+          const stop = gidWatchStop;
+          gidWatchStop = null;
+          if (stop) stop();
+        }
+      );
+    };
+
     const handleRouteChange = () => {
       syncRelationshipPageMode();
+      watchTimelineTabs();
       if (!isHomeRootRoute()) {
         rootVisitHandled = false;
         endReconcile();
@@ -1066,7 +1170,9 @@
       startReconcile();
     };
 
+    rewriteRootRouteToLatest();
     WB_INTERNAL.dom.subscribeRoute('timeline-default', handleRouteChange);
+    watchTimelineTabs();
     startReconcile();
   })();
 
@@ -1203,6 +1309,13 @@
   // 0.994px），仍会被截成 0 并沿用旧行高。2px 壳实测后至少保留为 1，
   // 同时在视觉上仍完全不可见。
   const VIRTUAL_MEASUREMENT_SHELL_PX = 2;
+  // 虚拟行内的内容全部隐藏后，行本身测得 0。vue-virtual-scroller 忽略恰好为
+  // 0 的测量值并沿用旧行高，该行原先占的高度留在原地成为空白，滚动器也不会
+  // 因为出现空位而补足可视区内的条目。此标记加在行内的直接内容壳上，由样式
+  // 保留 2px 的不可见测量壳，行随之测得正整数。行本身的 transform 与高度不受
+  // 影响，仍由 Vue 掌握。
+  const VIRTUAL_ROW_SHELL_ATTR = 'data-__wb_virtual_row_shell_by_userscript';
+  const VIRTUAL_ROW_SHELL_SELECTOR = `[${VIRTUAL_ROW_SHELL_ATTR}]`;
   const VIRTUAL_ITEM_SELECTOR = [
     '.vue-recycle-scroller__item-view',
     '[class*="vue-recycle-scroller__item-view"]',
@@ -1998,6 +2111,26 @@
          * and page scaling can make the rect slightly smaller than 1px. We
          * intentionally
          * do not touch the outer item view, its transform, or wrapper height.
+         */
+        display: block !important;
+        height: ${VIRTUAL_MEASUREMENT_SHELL_PX}px !important;
+        min-height: ${VIRTUAL_MEASUREMENT_SHELL_PX}px !important;
+        max-height: ${VIRTUAL_MEASUREMENT_SHELL_PX}px !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 0 !important;
+        overflow: hidden !important;
+        opacity: 0 !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+      }
+      ${VIRTUAL_ROW_SHELL_SELECTOR} {
+        /*
+         * Collapse a fully hidden virtual row to the same 2px measurement
+         * shell used for direct item-view children. The comment list nests
+         * the hidden node deeper (item-view > scroller-item > list > item),
+         * so the direct-child rule above never matches there and the row
+         * would keep its pre-hide height as blank space.
          */
         display: block !important;
         height: ${VIRTUAL_MEASUREMENT_SHELL_PX}px !important;
@@ -3754,21 +3887,63 @@
   // with Vue's own recycling update. Send the same scoped notification after a
   // hide/restore transition so the current item id is remeasured immediately.
   // This never changes Vue's transform, item array or wrapper height.
+  // 核对一行是否还有可见内容：先摘掉测量壳再测量，行高不足一个测量壳时说明
+  // 内容已经全部隐藏，重新挂上测量壳。返回标记是否发生了变化。
+  function syncVirtualRowMeasurementShell(view) {
+    if (!(view instanceof Element)) return false;
+    const content = view.firstElementChild;
+    if (!(content instanceof Element)) return false;
+    const hadShell = content.hasAttribute(VIRTUAL_ROW_SHELL_ATTR);
+    if (hadShell) content.removeAttribute(VIRTUAL_ROW_SHELL_ATTR);
+    const collapsed =
+      view.getBoundingClientRect().height < VIRTUAL_MEASUREMENT_SHELL_PX;
+    if (collapsed) content.setAttribute(VIRTUAL_ROW_SHELL_ATTR, '1');
+    return collapsed !== hadShell;
+  }
+
+  // Vue 会把整行复用给另一条内容。测量壳因此必须在每轮过滤时重新核对，否则
+  // 复用后的可见内容会继续沿用 2px 的壳高。只遍历已带标记的行，数量等于当前
+  // 完全隐藏的行数。
+  function syncVirtualRowMeasurementShells(root = document) {
+    const scope = root && root.querySelectorAll ? root : document;
+    const marked = [];
+    if (
+      scope instanceof Element &&
+      scope.matches(VIRTUAL_ROW_SHELL_SELECTOR)
+    ) {
+      marked.push(scope);
+    }
+    scope
+      .querySelectorAll(VIRTUAL_ROW_SHELL_SELECTOR)
+      .forEach((node) => marked.push(node));
+    Array.from(new Set(marked)).forEach((content) => {
+      const view = content.parentElement;
+      if (!(view instanceof Element) || !view.matches(VIRTUAL_VIEW_SELECTOR)) {
+        content.removeAttribute(VIRTUAL_ROW_SHELL_ATTR);
+        return;
+      }
+      if (syncVirtualRowMeasurementShell(view)) {
+        requestNativeVirtualItemRemeasure(content);
+      }
+    });
+  }
+
   function requestNativeVirtualItemRemeasure(shell) {
     if (!(shell instanceof Element)) return;
-    const view =
-      shell.parentElement?.matches(VIRTUAL_VIEW_SELECTOR)
-        ? shell.parentElement
-        : null;
+    // 隐藏目标不一定是虚拟行的直接子节点。评论区的层级是 item-view >
+    // wbpro-scroller-item > wbpro-list > 评论项，按父节点匹配取不到行，重测
+    // 通知不会发出，行高一直停留在隐藏之前的数值。
+    const view = shell.closest(VIRTUAL_VIEW_SELECTOR);
     if (!view) return;
 
     let sent = false;
     const send = () => {
       if (sent) return;
-      if (!view.isConnected || shell.parentElement !== view) {
+      if (!view.isConnected || !shell.isConnected || !view.contains(shell)) {
         sent = true;
         return;
       }
+      syncVirtualRowMeasurementShell(view);
       const rect = view.getBoundingClientRect();
       if (
         !Number.isFinite(rect.width) ||
@@ -4913,13 +5088,14 @@
           compactVirtualScrollerGaps(document);
           nudgeTimelineLayout();
         }
-        if (
-          CONTENT_FILTER_CFG.hideBlacklistComments &&
-          isCommentContentRoot(post)
-        ) {
-          const commentList = post.closest('.wbpro-list') || post.parentElement;
-          hideBlockedCommentRoots(commentList || post);
-        } else if (CONTENT_FILTER_CFG.hideBlacklistPosts) {
+        // 子评论不匹配评论根选择器，findContentRootForUID 取到的 post 也不会
+        // 被 isCommentContentRoot 认出来。原先按 post 的形态在评论与微博两条
+        // 路径之间二选一，屏蔽子评论时两条都不覆盖，要等评论区下一次重新渲染
+        // 才生效。评论侧因此无条件执行一次。
+        if (CONTENT_FILTER_CFG.hideBlacklistComments) {
+          hideBlockedCommentRoots(document);
+        }
+        if (CONTENT_FILTER_CFG.hideBlacklistPosts) {
           hideBlockedDOMPosts(document);
           scheduleBlockedDOMRefresh();
         }
@@ -5588,6 +5764,7 @@
       return;
     }
     restoreRecycledVirtualContentShells(root);
+    syncVirtualRowMeasurementShells(document);
     if (!BL.size) {
       compactVirtualScrollerGaps(root);
       return;
@@ -5620,9 +5797,17 @@
   function queueBlockedDOMRefresh(root = document, delay = 60) {
     WB_INTERNAL.dom.schedule(
       'blocked-content-filter',
-      () => hideBlockedDOMPosts(root || document),
+      () => refreshBlockedContent(root || document),
       delay
     );
+  }
+
+  // 评论侧按 findCommentRootForUID 单独定位隐藏目标，微博侧的过滤不覆盖它。
+  // 两者必须成对执行，否则只有重新渲染过的评论才会被隐藏。
+  function refreshBlockedContent(root = document) {
+    const scope = root || document;
+    hideBlockedDOMPosts(scope);
+    hideBlockedCommentRoots(scope);
   }
 
   function nudgeTimelineLayout() {
@@ -5658,7 +5843,7 @@
     queueBlockedDOMRefresh(document, 16);
     WB_INTERNAL.dom.schedule(
       'blocked-content-followup',
-      () => hideBlockedDOMPosts(document),
+      () => refreshBlockedContent(document),
       320
     );
   }

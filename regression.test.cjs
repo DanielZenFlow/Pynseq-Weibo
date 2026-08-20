@@ -667,8 +667,8 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+2\.4\.3/);
-assert.match(source, /const SCRIPT_VERSION = '2\.4\.3'/);
+assert.match(source, /@version\s+2\.4\.4/);
+assert.match(source, /const SCRIPT_VERSION = '2\.4\.4'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
@@ -1084,12 +1084,19 @@ assert.doesNotMatch(
   /\[class\*="vue-recycle-scroller__item-view"\]\s*\{[\s\S]*?(?:transform|min-height):/
 );
 const nativeVirtualRemeasureSource = sourceBetween(
-  '  function requestNativeVirtualItemRemeasure(',
+  '  function syncVirtualRowMeasurementShell(',
   '  function hideContentRoot('
+);
+// 隐藏目标不一定是虚拟行的直接子节点：评论区的层级是 item-view >
+// wbpro-scroller-item > wbpro-list > 评论项。按父节点匹配取不到行，重测通知
+// 不会发出，行高停留在隐藏之前的数值，原位置留下整段空白。
+assert.doesNotMatch(
+  nativeVirtualRemeasureSource,
+  /shell\.parentElement\?\.matches\(VIRTUAL_VIEW_SELECTOR\)/
 );
 assert.match(
   nativeVirtualRemeasureSource,
-  /shell\.parentElement\?\.matches\(VIRTUAL_VIEW_SELECTOR\)/
+  /const view = shell\.closest\(VIRTUAL_VIEW_SELECTOR\);/
 );
 assert.match(
   nativeVirtualRemeasureSource,
@@ -1104,14 +1111,49 @@ class FakeVirtualElement {
     this.isView = isView;
     this.rect = rect;
     this.parentElement = null;
+    this.children = [];
+    this.attrs = new Map();
     this.isConnected = true;
     this.events = [];
   }
+  get firstElementChild() {
+    return this.children[0] || null;
+  }
   matches(selector) {
-    return this.isView && selector === '.virtual-view';
+    if (selector === '.virtual-view') return this.isView;
+    if (selector === '[row-shell]') return this.attrs.has('row-shell');
+    return false;
+  }
+  closest(selector) {
+    let node = this;
+    while (node) {
+      if (node.matches(selector)) return node;
+      node = node.parentElement;
+    }
+    return null;
+  }
+  contains(node) {
+    let current = node;
+    while (current) {
+      if (current === this) return true;
+      current = current.parentElement;
+    }
+    return false;
+  }
+  hasAttribute(name) {
+    return this.attrs.has(name);
+  }
+  setAttribute(name, value) {
+    this.attrs.set(name, value);
+  }
+  removeAttribute(name) {
+    this.attrs.delete(name);
+  }
+  querySelectorAll() {
+    return [];
   }
   getBoundingClientRect() {
-    return this.rect;
+    return typeof this.rect === 'function' ? this.rect() : this.rect;
   }
   dispatchEvent(event) {
     this.events.push(event);
@@ -1129,6 +1171,10 @@ const nativeVirtualRemeasureContext = vm.createContext({
   Element: FakeVirtualElement,
   CustomEvent: FakeCustomEvent,
   VIRTUAL_VIEW_SELECTOR: '.virtual-view',
+  VIRTUAL_ROW_SHELL_ATTR: 'row-shell',
+  VIRTUAL_ROW_SHELL_SELECTOR: '[row-shell]',
+  VIRTUAL_MEASUREMENT_SHELL_PX: 2,
+  document: { querySelectorAll: () => [] },
   requestAnimationFrame(callback) {
     virtualFrames.push(callback);
   },
@@ -1138,7 +1184,8 @@ const nativeVirtualRemeasureContext = vm.createContext({
 });
 vm.runInContext(
   `${nativeVirtualRemeasureSource}
-   this.requestNativeVirtualItemRemeasure = requestNativeVirtualItemRemeasure;`,
+   this.requestNativeVirtualItemRemeasure = requestNativeVirtualItemRemeasure;
+   this.syncVirtualRowMeasurementShell = syncVirtualRowMeasurementShell;`,
   nativeVirtualRemeasureContext
 );
 const virtualView = new FakeVirtualElement({
@@ -1147,6 +1194,7 @@ const virtualView = new FakeVirtualElement({
 });
 const virtualShell = new FakeVirtualElement();
 virtualShell.parentElement = virtualView;
+virtualView.children = [virtualShell];
 nativeVirtualRemeasureContext.requestNativeVirtualItemRemeasure(virtualShell);
 while (virtualFrames.length) virtualFrames.shift()();
 virtualTimers.forEach((callback) => callback());
@@ -1163,6 +1211,57 @@ assert.deepEqual(
   },
   { width: 640, height: 1.988 }
 );
+// 端到端：整行内容被隐藏后重测通知必须先挂上测量壳再上报，否则上报的高度是
+// 0，滚动器忽略它并沿用旧行高。
+const collapsedView = new FakeVirtualElement({ isView: true });
+const collapsedShell = new FakeVirtualElement();
+collapsedShell.parentElement = collapsedView;
+collapsedView.children = [collapsedShell];
+collapsedView.rect = () => ({
+  width: 640,
+  height: collapsedShell.hasAttribute('row-shell') ? 2 : 0,
+});
+nativeVirtualRemeasureContext.requestNativeVirtualItemRemeasure(collapsedShell);
+while (virtualFrames.length) virtualFrames.shift()();
+virtualTimers.splice(0).forEach((callback) => callback());
+assert.equal(
+  collapsedShell.hasAttribute('row-shell'),
+  true,
+  'remeasure must install the measurement shell before reporting the size'
+);
+assert.equal(collapsedView.events.length, 1);
+assert.equal(collapsedView.events[0].detail.contentRect.height, 2);
+
+// 行内的内容全部隐藏之后，行本身测得 0。vue-virtual-scroller 忽略恰好为 0 的
+// 测量值并沿用旧行高，空位留在原地，滚动器也不会因为出现空位而补足可视区内
+// 的条目。评论区里整屏评论都被屏蔽时，整个评论区就是这样变成空白的。
+const rowShellView = new FakeVirtualElement({ isView: true });
+const rowShellContent = new FakeVirtualElement();
+rowShellContent.parentElement = rowShellView;
+rowShellView.children = [rowShellContent];
+rowShellView.rect = () => ({
+  width: 640,
+  height: rowShellContent.hasAttribute('row-shell') ? 2 : 0,
+});
+assert.equal(
+  nativeVirtualRemeasureContext.syncVirtualRowMeasurementShell(rowShellView),
+  true
+);
+assert.equal(
+  rowShellContent.hasAttribute('row-shell'),
+  true,
+  'a fully hidden virtual row must keep a 2px measurement shell'
+);
+// Vue 把同一行复用给可见内容之后，测量壳必须撤掉，否则复用后的内容被压成 2px。
+rowShellView.rect = () => ({
+  width: 640,
+  height: rowShellContent.hasAttribute('row-shell') ? 2 : 180,
+});
+assert.equal(
+  nativeVirtualRemeasureContext.syncVirtualRowMeasurementShell(rowShellView),
+  true
+);
+assert.equal(rowShellContent.hasAttribute('row-shell'), false);
 const hideContentRootSource = sourceBetween(
   '  function hideContentRoot(',
   '  let floatingVideoSuppressUntil ='
@@ -2540,6 +2639,9 @@ class FakeTimelineTab {
     if (name === 'title') return this.title;
     return null;
   }
+  closest() {
+    return this.link || null;
+  }
 }
 const allFollowingTimelineTab = new FakeTimelineTab('全部关注');
 const latestTimelineTab = new FakeTimelineTab('最新微博');
@@ -2629,8 +2731,15 @@ const reconcileContext = vm.createContext({
       subscribeRoute(channel, callback) {
         reconcileRoutes.set(channel, callback);
       },
+      subscribeMutations() {
+        return () => {};
+      },
     },
   },
+  GM_getValue: (key, fallback) => fallback,
+  GM_setValue() {},
+  GM_deleteValue() {},
+  history: { replaceState() {} },
   document: {
     documentElement: {},
     addEventListener(type, handler) {
@@ -2716,6 +2825,205 @@ reconcileRoutes.get('timeline-default')();
 assert.equal(reconcileScheduled.has('timeline-tab-reconcile'), false);
 assert.equal(reconcileLatestTab.clicks, 2);
 
+// 记下 gid 之后，脚本在页面脚本执行之前把根路由改写成「最新微博」的地址。
+// 微博前端初始化路由时读到的就是该分栏，不再请求「全部关注」的内容，页面也
+// 就没有"先渲染一个分栏再切换到另一个分栏"的过程。
+const rewriteStore = { WB_latest_timeline_gid: '110001635218563' };
+const rewriteScheduled = new Map();
+const rewriteMutationSubs = new Map();
+const rewriteReplaced = [];
+const rewriteAssigns = [];
+const rewriteLocation = {
+  hostname: 'weibo.com',
+  pathname: '/',
+  search: '',
+  origin: 'https://weibo.com',
+  replace(url) {
+    rewriteAssigns.push(url);
+  },
+};
+const rewriteLatestTab = new FakeTimelineTab('最新微博');
+let rewriteMountedTab = null;
+const rewriteContext = vm.createContext({
+  WB_INTERNAL: {
+    dom: {
+      schedule(channel, callback) {
+        rewriteScheduled.set(channel, callback);
+      },
+      cancel(channel) {
+        return rewriteScheduled.delete(channel);
+      },
+      subscribeRoute() {},
+      subscribeMutations(channel, callback) {
+        rewriteMutationSubs.set(channel, callback);
+        return () => rewriteMutationSubs.delete(channel);
+      },
+    },
+  },
+  document: {
+    documentElement: {},
+    visibilityState: 'visible',
+    addEventListener() {},
+    querySelector(selector) {
+      if (selector.includes('最新微博')) return rewriteMountedTab;
+      return null;
+    },
+  },
+  MutationObserver: class {
+    constructor(callback) {
+      this.callback = callback;
+    }
+    observe() {}
+    disconnect() {}
+  },
+  HTMLElement: FakeTimelineTab,
+  Element: FakeTimelineTab,
+  Date: { now: () => 1000000 },
+  location: rewriteLocation,
+  history: {
+    replaceState(state, title, url) {
+      rewriteReplaced.push(url);
+      const [path, search] = String(url).split('?');
+      rewriteLocation.pathname = path;
+      rewriteLocation.search = search ? '?' + search : '';
+    },
+  },
+  GM_getValue: (key, fallback) =>
+    key in rewriteStore ? rewriteStore[key] : fallback,
+  GM_setValue(key, value) {
+    rewriteStore[key] = value;
+  },
+  GM_deleteValue(key) {
+    delete rewriteStore[key];
+  },
+  TIMELINE_TAB_TITLES: [
+    '全部关注',
+    '最新微博',
+    '特别关注',
+    '好友圈',
+    '悄悄关注',
+  ],
+  timelineDefault: { value: true },
+  isTrustedUserEvent: () => true,
+  syncRelationshipPageMode() {},
+});
+vm.runInContext(
+  `${sourceBetween(
+    '  function findTimelineTabElement(title) {',
+    '  WB_INTERNAL.timelineTabs = Object.freeze({'
+  )}
+  ${forceLatestTabSource}`,
+  rewriteContext
+);
+assert.deepEqual(rewriteReplaced, ['/mygroups?gid=110001635218563']);
+assert.equal(
+  rewriteScheduled.has('timeline-tab-reconcile'),
+  false,
+  'a rewritten route is already on the target tab, so no clicking is needed'
+);
+assert.ok(rewriteScheduled.has('timeline-tab-rewrite-verify'));
+// 分栏条挂载后核对：链接上的 gid 与地址一致时，撤掉校验计时器且不点击。
+rewriteLatestTab.link = {
+  getAttribute: (name) =>
+    name === 'href' ? '/mygroups?gid=110001635218563' : null,
+};
+rewriteMountedTab = rewriteLatestTab;
+rewriteMutationSubs.get('timeline-tab-gid')();
+assert.equal(rewriteScheduled.has('timeline-tab-rewrite-verify'), false);
+assert.equal(rewriteLatestTab.clicks, 0);
+assert.equal(rewriteStore.WB_latest_timeline_gid, '110001635218563');
+
+// gid 失效时，改写把页面带到一个打不开的地址。分栏条始终不出现，校验到期后
+// 清掉 gid 并回到根路由，下一次加载没有 gid 可用，自动退回点击纠正。
+const staleStore = { WB_latest_timeline_gid: '999999999999' };
+const staleScheduled = new Map();
+const staleReplaced = [];
+const staleAssigns = [];
+const staleLocation = {
+  hostname: 'weibo.com',
+  pathname: '/',
+  search: '',
+  origin: 'https://weibo.com',
+  replace(url) {
+    staleAssigns.push(url);
+  },
+};
+const staleContext = vm.createContext({
+  WB_INTERNAL: {
+    dom: {
+      schedule(channel, callback) {
+        staleScheduled.set(channel, callback);
+      },
+      cancel(channel) {
+        return staleScheduled.delete(channel);
+      },
+      subscribeRoute() {},
+      subscribeMutations() {
+        return () => {};
+      },
+    },
+  },
+  document: {
+    documentElement: {},
+    visibilityState: 'visible',
+    addEventListener() {},
+    querySelector: () => null,
+  },
+  MutationObserver: class {
+    constructor(callback) {
+      this.callback = callback;
+    }
+    observe() {}
+    disconnect() {}
+  },
+  HTMLElement: FakeTimelineTab,
+  Element: FakeTimelineTab,
+  Date: { now: () => 1000000 },
+  location: staleLocation,
+  history: {
+    replaceState(state, title, url) {
+      staleReplaced.push(url);
+      const [path, search] = String(url).split('?');
+      staleLocation.pathname = path;
+      staleLocation.search = search ? '?' + search : '';
+    },
+  },
+  GM_getValue: (key, fallback) =>
+    key in staleStore ? staleStore[key] : fallback,
+  GM_setValue(key, value) {
+    staleStore[key] = value;
+  },
+  GM_deleteValue(key) {
+    delete staleStore[key];
+  },
+  TIMELINE_TAB_TITLES: [
+    '全部关注',
+    '最新微博',
+    '特别关注',
+    '好友圈',
+    '悄悄关注',
+  ],
+  timelineDefault: { value: true },
+  isTrustedUserEvent: () => true,
+  syncRelationshipPageMode() {},
+});
+vm.runInContext(
+  `${sourceBetween(
+    '  function findTimelineTabElement(title) {',
+    '  WB_INTERNAL.timelineTabs = Object.freeze({'
+  )}
+  ${forceLatestTabSource}`,
+  staleContext
+);
+assert.deepEqual(staleReplaced, ['/mygroups?gid=999999999999']);
+staleScheduled.get('timeline-tab-rewrite-verify')();
+assert.equal(
+  'WB_latest_timeline_gid' in staleStore,
+  false,
+  'an unusable stored gid must be dropped so the next load falls back to clicking'
+);
+assert.deepEqual(staleAssigns, ['https://weibo.com/']);
+
 const remoteConfigSource = sourceBetween(
   "  if (typeof GM_addValueChangeListener === 'function') {",
   "  if (document.readyState === 'loading')"
@@ -2723,6 +3031,31 @@ const remoteConfigSource = sourceBetween(
 assert.match(remoteConfigSource, /WB_INTERNAL\.applyConfig\?\.\(CFG\)/);
 assert.match(remoteConfigSource, /reconcileHomeTimelineSetting\(/);
 assert.match(remoteConfigSource, /syncCreatedSettingsPanelConfigUI\(\)/);
+
+// 评论侧按 findCommentRootForUID 单独定位隐藏目标，微博侧的过滤不覆盖它。
+// 两者必须成对执行，否则只有重新渲染过的评论才会被隐藏。
+assert.match(
+  sourceBetween(
+    '  function refreshBlockedContent(',
+    '  function nudgeTimelineLayout('
+  ),
+  /hideBlockedDOMPosts\(scope\);[\s\S]*?hideBlockedCommentRoots\(scope\);/
+);
+// 子评论不匹配评论根选择器，findContentRootForUID 取到的 post 也不会被
+// isCommentContentRoot 认出来。按 post 的形态在评论与微博两条路径之间二选一
+// 时，屏蔽子评论两条都不覆盖，要等评论区下一次重新渲染才生效。
+const contextBlockSource = sourceBetween(
+  '  async function addContextUserToBL(ctx, options = {}) {',
+  '      // DOM filtering is best-effort.'
+);
+assert.doesNotMatch(
+  contextBlockSource,
+  /hideBlacklistComments &&\s*isCommentContentRoot\(post\)/
+);
+assert.match(
+  contextBlockSource,
+  /if \(CONTENT_FILTER_CFG\.hideBlacklistComments\) \{\s*hideBlockedCommentRoots\(document\);/
+);
 
 const hotBandSource = sourceBetween(
   '  function hideSearchHotBand(root = document) {',
