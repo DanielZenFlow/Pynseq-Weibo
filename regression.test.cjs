@@ -667,8 +667,8 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+2\.4\.54/);
-assert.match(source, /const SCRIPT_VERSION = '2\.4\.54'/);
+assert.match(source, /@version\s+2\.4\.55/);
+assert.match(source, /const SCRIPT_VERSION = '2\.4\.55'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
@@ -2370,15 +2370,37 @@ const recycledAdSource = sourceBetween(
 // 这些条目的隐藏状态永远不会被重新核对：分档设置改成不隐藏，已经隐藏的条目
 // 也无法恢复。
 assert.doesNotMatch(recycledAdSource, /node\.closest\(VIRTUAL_VIEW_SELECTOR\)/);
-// 复核必须覆盖整篇文档。DOM 变更回调交来的常常是新插入的子树，按该子树复核
-// 时，设置变更之前就已经隐藏的条目不在范围内，隐藏状态会一直保留到下一次
-// 恰好把它包含进来的刷新为止。
+// 广告与推荐内容的隐藏由设置项控制，设置变更不产生 DOM 变更，复核范围必须是
+// 整篇文档，否则改成不隐藏之后已经隐藏的条目不会恢复。
+const revalidateScopeSource = sourceBetween(
+  '  function restoreRecycledVirtualContentShells(',
+  '  function hideBlockedDOMPosts('
+);
+assert.match(
+  revalidateScopeSource,
+  /restoreRecycledVirtualAdShells\(document\);/
+);
+assert.match(
+  revalidateScopeSource,
+  /restoreRecycledVirtualTimelineRecommendationShells\(document\);/
+);
+// 黑名单侧只在传入范围内复核。它的判定依赖节点上的 uid 标记，Vue 重新渲染期间
+// 节点会短暂处于标记缺失的状态；对整篇文档复核会把这一刻的条目误判成「不再属于
+// 被屏蔽用户」并解除隐藏，页面上表现为被屏蔽的内容重新出现。
+assert.match(
+  revalidateScopeSource,
+  /scope[\s\S]*?\.querySelectorAll\(BLOCKED_CONTENT_HIDE_SELECTOR\)/
+);
+assert.doesNotMatch(
+  revalidateScopeSource,
+  /document\s*\.querySelectorAll\(BLOCKED_CONTENT_HIDE_SELECTOR\)/
+);
 assert.match(
   sourceBetween(
     '  function hideBlockedDOMPosts(',
     '  function queueBlockedDOMRefresh('
   ),
-  /restoreRecycledVirtualContentShells\(document\);/
+  /restoreRecycledVirtualContentShells\(root\);/
 );
 // 行为验证：分档设置改成不隐藏之后，已经带标记且不在虚拟行内的条目必须恢复。
 class FakeAdNode {
@@ -2450,7 +2472,7 @@ assert.match(
     '  function restoreRecycledVirtualContentShells(',
     '  function hideBlockedDOMPosts('
   ),
-  /restoreRecycledVirtualAdShells\(scope\);/
+  /restoreRecycledVirtualAdShells\(document\);/
 );
 const recycledTimelineRecommendationSource = sourceBetween(
   '  function restoreRecycledVirtualTimelineRecommendationShells(scope) {',
@@ -2465,7 +2487,7 @@ assert.match(
     '  function restoreRecycledVirtualContentShells(',
     '  function hideBlockedDOMPosts('
   ),
-  /restoreRecycledVirtualTimelineRecommendationShells\(scope\);/
+  /restoreRecycledVirtualTimelineRecommendationShells\(document\);/
 );
 
 class FakeTimelineRecommendationElement {

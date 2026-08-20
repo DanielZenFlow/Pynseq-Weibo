@@ -4,7 +4,7 @@
 // @name:zh-CN   Pynseq for Weibo｜屏序·微博｜本地屏蔽名单与时间线控制｜屏蔽热搜
 // @name:en      Pynseq for Weibo｜屏序·微博｜本地屏蔽名单与时间线控制｜屏蔽热搜
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
-// @version      2.4.54
+// @version      2.4.55
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
 // @description:en Restore a chronological Weibo timeline, locally block unwanted users, filter ads, simplify navigation, and manage official Weibo blocklist synchronization.
 // @author       DanielZenFlow
@@ -41,7 +41,7 @@
   const WB_INTERNAL = Object.create(null);
   const THROTTLE_MS = 350; // 新浪微博官方黑名单分页请求间隔（毫秒）
   const SCRIPT_NAME = 'Pynseq for Weibo｜屏序·微博';
-  const SCRIPT_VERSION = '2.4.54';
+  const SCRIPT_VERSION = '2.4.55';
   const GITHUB_URL = 'https://github.com/DanielZenFlow/Pynseq-Weibo';
   const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/danielzenflow';
   const ONBOARDING_DONE_KEY = 'pynseq_for_weibo_onboarding_done_v1';
@@ -5802,8 +5802,15 @@
       root instanceof Element
         ? root.closest(VIRTUAL_VIEW_SELECTOR) || root
         : root;
-    restoreRecycledVirtualAdShells(scope);
-    restoreRecycledVirtualTimelineRecommendationShells(scope);
+    // 广告与推荐内容的隐藏由设置项控制，设置变更不产生 DOM 变更，没有可以搭
+    // 便车的子树，复核范围必须是整篇文档；否则改成不隐藏之后，已经隐藏的条目
+    // 不会恢复。命中数量等于当前已隐藏的条目数。
+    restoreRecycledVirtualAdShells(document);
+    restoreRecycledVirtualTimelineRecommendationShells(document);
+    // 黑名单侧只在传入范围内复核。它的判定依赖节点上的 uid 标记，Vue 重新渲染
+    // 期间节点会短暂处于标记缺失的状态，对整篇文档复核会把这一刻的条目误判成
+    // 「不再属于被屏蔽用户」并解除隐藏，页面上表现为被屏蔽的内容重新出现。
+    // 名单本身变更时走 refreshBlockedDOMAfterBLChange，那条路径另有完整刷新。
     const nodes = [];
     if (
       scope instanceof Element &&
@@ -5851,10 +5858,7 @@
       restoreHiddenRelationshipItems(document);
       return;
     }
-    // 复核必须覆盖整篇文档。DOM 变更回调交来的常常是新插入的子树，按该子树
-    // 复核时，设置变更之前就已经隐藏的条目不在范围内，隐藏状态会一直保留到
-    // 下一次恰好把它包含进来的刷新为止。命中数量等于当前已隐藏的条目数。
-    restoreRecycledVirtualContentShells(document);
+    restoreRecycledVirtualContentShells(root);
     syncVirtualRowMeasurementShells(document);
     if (!BL.size) {
       compactVirtualScrollerGaps(root);
