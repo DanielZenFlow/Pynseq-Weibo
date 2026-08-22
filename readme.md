@@ -45,6 +45,7 @@
 
 - 在可识别的用户名文字区域点击鼠标右键，然后选择本地屏蔽操作。
 - 如需同步微博账户黑名单，可选择“同时加入新浪微博官方黑名单”的操作。
+- 在 `s.weibo.com` 搜索页执行该组合操作时，脚本会临时打开带任务参数的 `weibo.com` 中继页，以同源方式写入新浪微博官方黑名单。中继页不会触发“主页默认显示「最新微博」”的路由切换。
 - 在“设置 → 本地屏蔽名单”中输入 UID，或批量粘贴多个 UID。
 
 ### 管理屏蔽范围
@@ -150,6 +151,7 @@ Project page: [Pynseq for Weibo on Greasy Fork](https://greasyfork.org/en/script
 
 - Right-click an identifiable username and select a local blocking action.
 - Select the action that also adds the user to Weibo's official blocklist when account-level blocking is required.
+- On `s.weibo.com`, the combined action temporarily opens a task-bearing `weibo.com` relay page so the official blocklist request runs under the main-site origin. The relay page is exempt from the default “Latest Weibo” route switch.
 - Enter one or more UIDs under “Settings → Local Blocklist”.
 
 ### Configure filtering

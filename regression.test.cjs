@@ -667,8 +667,8 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+2\.4\.55/);
-assert.match(source, /const SCRIPT_VERSION = '2\.4\.55'/);
+assert.match(source, /@version\s+2\.4\.56/);
+assert.match(source, /const SCRIPT_VERSION = '2\.4\.56'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
@@ -2183,6 +2183,33 @@ const relaySource = sourceBetween(
   '  function requestOfficialBlockViaMainHost(uid) {',
   '  async function processOfficialBlockRelay() {'
 );
+const relayURLGuardSource = sourceBetween(
+  "  const OFFICIAL_BLOCK_RELAY_PARAM = 'wb_retro_official_block';",
+  '  let centeredConfirmQueue = Promise.resolve();'
+);
+const relayURLGuardContext = { URL };
+vm.runInNewContext(
+  `${relayURLGuardSource}
+   globalThis.hasOfficialBlockRelayRequest = hasOfficialBlockRelayRequest;`,
+  relayURLGuardContext
+);
+assert.equal(
+  relayURLGuardContext.hasOfficialBlockRelayRequest(
+    'https://weibo.com/?wb_retro_official_block=1787356800000-test'
+  ),
+  true
+);
+assert.equal(
+  relayURLGuardContext.hasOfficialBlockRelayRequest('https://weibo.com/'),
+  false
+);
+assert.match(
+  sourceBetween(
+    '  (function forceLatestTab() {',
+    "    const LATEST_TITLE = '最新微博';"
+  ),
+  /if \(hasOfficialBlockRelayRequest\(\)\) return;/
+);
 const relayCloseSource = sourceBetween(
   '  function scheduleOfficialBlockRelayClose(',
   '  function requestOfficialBlockViaMainHost('
@@ -2865,6 +2892,7 @@ const reconcileContext = vm.createContext({
     '悄悄关注',
   ],
   timelineDefault: { value: true },
+  hasOfficialBlockRelayRequest: () => false,
   isTrustedUserEvent: () => true,
   syncRelationshipPageMode() {},
 });
@@ -2998,6 +3026,7 @@ const rewriteContext = vm.createContext({
     '悄悄关注',
   ],
   timelineDefault: { value: true },
+  hasOfficialBlockRelayRequest: () => false,
   isTrustedUserEvent: () => true,
   syncRelationshipPageMode() {},
 });
@@ -3107,6 +3136,7 @@ const bootContext = vm.createContext({
     '悄悄关注',
   ],
   timelineDefault: { value: true },
+  hasOfficialBlockRelayRequest: () => false,
   isTrustedUserEvent: () => true,
   syncRelationshipPageMode() {},
 });
@@ -3196,6 +3226,7 @@ const staleContext = vm.createContext({
     '悄悄关注',
   ],
   timelineDefault: { value: true },
+  hasOfficialBlockRelayRequest: () => false,
   isTrustedUserEvent: () => true,
   syncRelationshipPageMode() {},
 });

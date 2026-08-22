@@ -92,6 +92,14 @@ node regression.test.cjs
 
 「全部关注」就是主页根路由 `/`，其余分栏是 `/mygroups?gid=...`。开启「主页默认显示「最新微博」」后，脚本需要点击分栏才能离开「全部关注」，接口层不做任何拦截。
 
+### 官方拉黑中继保护
+
+`s.weibo.com` 不能直接调用只允许主站同源执行的官方拉黑接口。组合屏蔽操作会打开 `https://weibo.com/?wb_retro_official_block=<任务标识>`，由主站标签页完成请求并把结果写回共享的用户脚本存储。
+
+带 `wb_retro_official_block` 参数的页面是任务中继页，不是首页时间线访问。`forceLatestTab` 必须在任何根路由改写、分栏纠正会话或相关监听器初始化之前退出，保留查询参数供后部的 `processOfficialBlockRelay` 读取。中继参数常量与 `hasOfficialBlockRelayRequest` 因此定义在 `forceLatestTab` 之前。
+
+回归测试必须同时覆盖带中继参数的主站 URL 与普通主站首页 URL：前者命中保护并跳过默认分栏初始化，后者保持原有首页分栏行为。
+
 开启该设置后有两条路径。
 
 **地址改写。** 脚本从「最新微博」分栏所在的链接上读取 gid，写入 `WB_latest_timeline_gid`，读取不发起请求。之后打开首页时，脚本在 document-start 阶段把根路由 `history.replaceState` 成 `/mygroups?gid=...`。此时页面脚本尚未执行，微博前端初始化路由时读到的就是「最新微博」，该次加载不会请求「全部关注」的内容。改写之后分栏条在 20 秒内仍未出现时，说明记录的 gid 已不可用，脚本清除它并回到根路由，下一次加载没有 gid 可用；页面不可见时只推迟判定。

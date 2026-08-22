@@ -4,7 +4,7 @@
 // @name:zh-CN   Pynseq for Weibo｜屏序·微博｜本地屏蔽名单与时间线控制｜屏蔽热搜
 // @name:en      Pynseq for Weibo｜屏序·微博｜本地屏蔽名单与时间线控制｜屏蔽热搜
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
-// @version      2.4.55
+// @version      2.4.56
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
 // @description:en Restore a chronological Weibo timeline, locally block unwanted users, filter ads, simplify navigation, and manage official Weibo blocklist synchronization.
 // @author       DanielZenFlow
@@ -41,7 +41,7 @@
   const WB_INTERNAL = Object.create(null);
   const THROTTLE_MS = 350; // 新浪微博官方黑名单分页请求间隔（毫秒）
   const SCRIPT_NAME = 'Pynseq for Weibo｜屏序·微博';
-  const SCRIPT_VERSION = '2.4.55';
+  const SCRIPT_VERSION = '2.4.56';
   const GITHUB_URL = 'https://github.com/DanielZenFlow/Pynseq-Weibo';
   const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/danielzenflow';
   const ONBOARDING_DONE_KEY = 'pynseq_for_weibo_onboarding_done_v1';
@@ -441,6 +441,17 @@
       : null;
   const _GM_openInTab =
     typeof GM_openInTab !== 'undefined' ? GM_openInTab : null;
+  const OFFICIAL_BLOCK_RELAY_PARAM = 'wb_retro_official_block';
+
+  function hasOfficialBlockRelayRequest(href = location.href) {
+    try {
+      return new URL(String(href)).searchParams.has(
+        OFFICIAL_BLOCK_RELAY_PARAM
+      );
+    } catch {
+      return false;
+    }
+  }
 
   let centeredConfirmQueue = Promise.resolve();
 
@@ -928,6 +939,11 @@
   });
 
   (function forceLatestTab() {
+    // 搜索子域的官方拉黑操作会打开带任务参数的主站中继页。中继处理器在脚本
+    // 后部运行；这里若先把根路由改写为 /mygroups，任务参数会被丢掉，发起页只
+    // 能等到超时。中继页不需要时间线初始化，因此整段跳过。
+    if (hasOfficialBlockRelayRequest()) return;
+
     const LATEST_TITLE = '最新微博';
     // 「全部关注」用的就是主页根路由 "/"，其余分栏是 /mygroups?gid=...。
     // 因此单看 pathname 无法区分"用户点了别的分栏"和"从站内其他页面回到
@@ -1194,7 +1210,6 @@
   const UID_MUTATION_LOCK_KEY = 'WB_BL_mutation_lock_v1';
   const OFFICIAL_BLOCK_REQUEST_KEY = 'WB_BL_official_block_request';
   const OFFICIAL_BLOCK_RESPONSE_KEY = 'WB_BL_official_block_response';
-  const OFFICIAL_BLOCK_RELAY_PARAM = 'wb_retro_official_block';
   const OFFICIAL_BLOCK_RELAY_TIMEOUT_MS = 15000;
   // 仅用于旧脚本管理器检查跨标签页写回结果，不会发起微博接口请求。
   const OFFICIAL_BLOCK_RELAY_COMPAT_POLL_MS = 250;
