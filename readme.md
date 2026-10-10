@@ -89,6 +89,7 @@
 - 页面尚未加载完成或没有提供可识别 UID 时，相关内容可能需要等待数据加载后才能被过滤。
 - 「最新微博」不是微博首页的根路由。脚本记录该分栏的地址之后，打开首页直接进入该分栏；首次使用时仍需等分栏渲染完成后再切换。从其他页面回到首页时，微博会先加载「全部关注」，脚本在切换完成前隐藏时间线列表，这段时间列表区域为空白。
 - 微博使用动态加载和虚拟列表，脚本只能处理当前浏览器已经接收并能够识别的内容。
+- 兼容 uBlock Origin 等广告拦截扩展：扩展的过滤规则隐藏整条微博时，脚本让时间线收回该条目占用的高度，不留空白；被扩展隐藏的内容保持隐藏。
 - 本地屏蔽不等同于新浪微博官方拉黑；只有明确选择官方黑名单操作时，才会修改微博账户中的官方黑名单。
 - 官方黑名单同步受微博接口状态、分页数据和访问频率限制。浏览器会限制后台标签页的计时器并可能冻结页面，完整同步在后台标签页中会明显变慢或暂停。
 - 删除官方已取消拉黑的 UID 依赖脚本记录的「出现在官方黑名单中的 UID」。该记录从 3.0.0 开始建立，因此 3.0.0 之后的第一次完整同步只建立记录、不删除，此后的完整同步才会删除。
@@ -197,6 +198,7 @@ Export the blocklist under “Settings → Local Blocklist”. The exported JSON
 - Content may remain visible until identity data becomes available when a page has not finished loading or does not expose an identifiable UID.
 - “Latest Weibo” is not the Weibo home root route. Once the script has recorded that tab’s address, the home page opens there directly; the first visit still switches after the feed tabs render. When you return to the home page from another page, Weibo loads “All Following” first; the script hides the timeline list until the switch completes, so the list area stays blank briefly.
 - Weibo uses dynamic loading and virtualized lists. The script can only process content received and identified by the current browser.
+- Works alongside ad blockers such as uBlock Origin: when a filter rule hides a whole post, the script lets the timeline reclaim that post's space so no blank gap remains. Content hidden by the extension stays hidden.
 - Local blocking is not the same as Weibo's official blocking feature. The official account blocklist changes only when the corresponding action is explicitly selected.
 - Official blocklist synchronization depends on Weibo endpoint availability, pagination data, and rate limits. Browsers throttle timers in background tabs and may freeze them, so a full sync in a background tab slows down or pauses.
 - Removing unblocked UIDs relies on the script's record of UIDs seen in the official blocklist. The record starts with 3.0.0, so the first full sync after upgrading only builds it; later full syncs remove unblocked UIDs.

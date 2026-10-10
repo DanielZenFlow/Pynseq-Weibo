@@ -127,7 +127,11 @@ node regression.test.cjs
 
 微博时间线使用 `vue-virtual-scroller`。隐藏条目时不改动外层 item-view 的 transform 与高度，只把内容壳压成 2px 的不可见测量壳——`DynamicScroller` 会忽略恰好为 0 的测量值并沿用旧行高。
 
-隐藏与恢复后都必须调用 `requestNativeVirtualItemRemeasure`，向 `DynamicScrollerItem` 发送局部 `resize` 通知。壳被回收给另一条微博时，需重新核对隐藏条件是否仍然成立，否则复用后的正常微博会继续沿用上一条的隐藏状态。
+隐藏与恢复后都必须调用 `requestNativeVirtualItemRemeasure`。壳被回收给另一条微博时，需重新核对隐藏条件是否仍然成立，否则复用后的正常微博会继续沿用上一条的隐藏状态。
+
+**尺寸上报的原生入口。** 微博当前使用的是 vue-virtual-scroller 2.x：`DynamicScrollerItem` 的根元素是 item-view 的直接子节点（如 `wbpro-scroller-item`，带 `data-index`），元素上挂着 `$_vs_onResize` 与 `$_vs_id`，共享的 ResizeObserver 回调直接调用 `$_vs_onResize(id, width, height)`。向 item-view 派发 `resize` CustomEvent 是 1.x 的监听方式，在 2.x 里没有监听者，实测派发后后续行坐标不变。2px 测量壳之所以有效，是原生 ResizeObserver 观察到了内容壳本身的尺寸变化，不是那个事件。`reportNativeVirtualItemSize` 经 `$_vs_onResize` 上报，`requestNativeVirtualItemRemeasure` 先走原生入口、再保留 1.x 的事件。
+
+**外部样式整行隐藏。** uBlock Origin 的中文过滤规则会直接作用在 item-view 上（实测 `.vue-recycle-scroller__item-view:has(img[src="…icon_auth_white.png"]) { display: none !important }`）。行测得 0，ResizeObserver 上报的 0 被忽略，原高度留在原地成为空白——这正是 2px 测量壳要解决的问题，只是隐藏者不是脚本。该规则以用户级样式注入：页面里的样式表无论特异性多高、内联 `display: block !important` 都覆盖不了，不要再尝试用 CSS 把行恢复显示。`syncExternallyHiddenVirtualRows` 找出高度不足 1px、但含 `$_vs_onResize` 元素的行，经原生入口上报 2px（与测量壳一致），行保持外部规则的隐藏状态；按 `$_vs_id` 记录已上报的条目，Vue 把行复用给另一条内容时重新上报。绘制前隐藏、每批 DOM 变更与过滤主流程都调用它。在 `/` 实测的空白行经此上报后，下一行从间隔 300px 收回到 2px。
 
 微博正文页的评论区使用同一套虚拟列表，但隐藏目标位于行内第三层：`item-view > wbpro-scroller-item > wbpro-list > 评论项`。`requestNativeVirtualItemRemeasure` 按 `closest` 定位所在的虚拟行，不能按父节点匹配，否则评论区取不到行，重测通知不会发出。
 

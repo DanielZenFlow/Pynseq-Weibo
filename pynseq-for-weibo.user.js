@@ -4481,6 +4481,71 @@
     });
   }
 
+  // 微博当前的 vue-virtual-scroller 2.x 在 DynamicScrollerItem 的根元素（虚拟行的
+  // 直接子节点）上挂 `$_vs_onResize` 与 `$_vs_id`，共享的 ResizeObserver 回调就是
+  // 调用它们上报尺寸。向 item-view 派发 `resize` 事件在该版本里没有监听者。
+  function findNativeVirtualItemElement(view) {
+    if (!(view instanceof Element)) return null;
+    for (const child of view.children) {
+      if (typeof child.$_vs_onResize === 'function') return child;
+    }
+    return null;
+  }
+
+  function reportNativeVirtualItemSize(view, height) {
+    const item = findNativeVirtualItemElement(view);
+    if (!item || !(height > 0)) return false;
+    const width =
+      view.getBoundingClientRect().width ||
+      view.parentElement?.getBoundingClientRect().width ||
+      0;
+    try {
+      item.$_vs_onResize(item.$_vs_id, width, height);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // 被页面之外的样式整行隐藏的虚拟行。uBlock Origin 的中文过滤规则（实测
+  // `.vue-recycle-scroller__item-view:has(img[src="…icon_auth_white.png"])
+  // { display: none !important }`）以用户级样式注入，页面内的样式与内联
+  // !important 都覆盖不了。行测得 0，ResizeObserver 上报的 0 被 DynamicScroller
+  // 忽略，原高度留在原地成为空白。这类行由脚本经原生入口上报 2px 测量值，
+  // 与自身隐藏条目的测量壳一致；行保持外部规则的隐藏状态，位移与行高
+  // 仍由 Vue 掌握。记录上报过的条目 id，Vue 把行复用给另一条内容时重新上报。
+  const externallyCollapsedRowIDs = new WeakMap();
+
+  function syncExternallyHiddenVirtualRows(root = document) {
+    if (!root || !root.querySelectorAll) return false;
+    const views = new Set();
+    if (root instanceof Element) {
+      const own = root.closest(VIRTUAL_VIEW_SELECTOR);
+      if (own) views.add(own);
+    }
+    root
+      .querySelectorAll(VIRTUAL_VIEW_SELECTOR)
+      .forEach((view) => views.add(view));
+    let changed = false;
+    views.forEach((view) => {
+      if (!view.isConnected) return;
+      const item = findNativeVirtualItemElement(view);
+      if (!item) return;
+      const collapsed = view.getBoundingClientRect().height < 1;
+      if (!collapsed) {
+        externallyCollapsedRowIDs.delete(view);
+        return;
+      }
+      const id = String(item.$_vs_id);
+      if (externallyCollapsedRowIDs.get(view) === id) return;
+      if (reportNativeVirtualItemSize(view, VIRTUAL_MEASUREMENT_SHELL_PX)) {
+        externallyCollapsedRowIDs.set(view, id);
+        changed = true;
+      }
+    });
+    return changed;
+  }
+
   function requestNativeVirtualItemRemeasure(shell) {
     if (!(shell instanceof Element)) return;
     // 隐藏目标不一定是虚拟行的直接子节点。评论区的层级是 item-view >
@@ -4498,14 +4563,18 @@
       }
       syncVirtualRowMeasurementShell(view);
       const rect = view.getBoundingClientRect();
-      if (
-        !Number.isFinite(rect.width) ||
-        !Number.isFinite(rect.height) ||
-        rect.height < 1
-      ) {
+      if (!Number.isFinite(rect.width) || !Number.isFinite(rect.height)) {
+        return;
+      }
+      if (rect.height < 1) {
+        // 行被外部样式整行隐藏时测得 0，原生 ResizeObserver 的 0 会被忽略，
+        // 由脚本按测量壳高度上报。
+        if (syncExternallyHiddenVirtualRows(view)) sent = true;
         return;
       }
       sent = true;
+      // 2.x 经元素上的原生入口上报；1.x 监听 item-view 上的 resize 事件。
+      reportNativeVirtualItemSize(view, rect.height);
       view.dispatchEvent(
         new CustomEvent('resize', {
           detail: {
@@ -6324,6 +6393,7 @@
     }
     restoreRecycledVirtualContentShells(root);
     syncVirtualRowMeasurementShells(document);
+    syncExternallyHiddenVirtualRows(document);
     if (!BL.size) {
       compactVirtualScrollerGaps(root);
       return;
@@ -6543,6 +6613,11 @@
         if (hideRecognizedAds(root)) hiddenAny = true;
         if (hideBlockedContentWithoutRestore(root)) hiddenAny = true;
       });
+      // 外部样式（广告拦截扩展的元素隐藏规则）在节点插入的同一刻就会命中整行，
+      // 同样要在首次测量之前换成测量壳。
+      roots.forEach((root) => {
+        if (syncExternallyHiddenVirtualRows(root)) hiddenAny = true;
+      });
       if (hiddenAny) {
         WB_INTERNAL.dom.schedule(
           'content-before-paint-layout',
@@ -6599,6 +6674,9 @@
         hideBlockedCommentRoots(addedElement);
       });
       if (needsFullRefresh) queueBlockedDOMRefresh(document, 30);
+      // 外部扩展可能晚于插入才隐藏整行（例如按自身观察器补写内联样式），Vue
+      // 也会把已标记的行复用给其他内容；每批变更后整篇核对一次。
+      syncExternallyHiddenVirtualRows(document);
     };
     WB_INTERNAL.dom.subscribeMutations('content-filter', (mutations) => {
       hideBeforePaint(mutations);

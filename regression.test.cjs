@@ -810,7 +810,7 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+3\.0\.0/);
+assert.match(source, /@version\s+3\.0\.0\s/);
 assert.match(source, /const SCRIPT_VERSION = '3\.0\.0'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
@@ -1249,6 +1249,68 @@ assert.doesNotMatch(
   nativeVirtualRemeasureSource,
   /\.style\.|transform|minHeight|scrollTo|scrollBy/
 );
+// 外部扩展（广告拦截的元素隐藏规则）把整行设为 none 时，行测得 0，原生
+// ResizeObserver 上报的 0 被 DynamicScroller 忽略，原高度留成空白。该规则以用户级
+// 样式注入，页面样式与内联 !important 都覆盖不了；脚本经 vue-virtual-scroller 2.x
+// 的原生入口 `$_vs_onResize` 上报 2px，向 item-view 派发 resize 事件在 2.x 无效。
+assert.match(
+  nativeVirtualRemeasureSource,
+  /reportNativeVirtualItemSize\(view, rect\.height\)/
+);
+assert.match(
+  nativeVirtualRemeasureSource,
+  /if \(rect\.height < 1\) \{[\s\S]*?syncExternallyHiddenVirtualRows\(view\)/
+);
+{
+  class ExtElement {
+    constructor(height = 0) {
+      this.height = height;
+      this.children = [];
+      this.isConnected = true;
+      this.parentElement = { getBoundingClientRect: () => ({ width: 600 }) };
+    }
+    getBoundingClientRect() {
+      return { width: this.height ? 600 : 0, height: this.height };
+    }
+    closest() {
+      return null;
+    }
+    querySelectorAll() {
+      return [];
+    }
+  }
+  const calls = [];
+  const view = new ExtElement(0);
+  const item = { $_vs_id: 35, $_vs_onResize: (...args) => calls.push(args) };
+  view.children = [item];
+  const extContext = vm.createContext({
+    Element: ExtElement,
+    VIRTUAL_VIEW_SELECTOR: '.view',
+    VIRTUAL_MEASUREMENT_SHELL_PX: 2,
+    WeakMap,
+    String,
+  });
+  vm.runInContext(
+    `${sourceBetween(
+      '  function findNativeVirtualItemElement(view) {',
+      '  function requestNativeVirtualItemRemeasure(shell) {'
+    )}
+    globalThis.syncExternal = syncExternallyHiddenVirtualRows;`,
+    extContext
+  );
+  const scope = { querySelectorAll: () => [view] };
+  assert.equal(extContext.syncExternal(scope), true);
+  assert.deepEqual(calls, [[35, 600, 2]], 'a row collapsed by outside CSS must report the 2px shell height natively');
+  // 同一条内容不重复上报；Vue 把行复用给另一条内容后重新上报。
+  assert.equal(extContext.syncExternal(scope), false);
+  item.$_vs_id = 36;
+  extContext.syncExternal(scope);
+  assert.deepEqual(calls[1], [36, 600, 2]);
+  // 行重新可见时交还给原生 ResizeObserver，不再上报。
+  view.height = 300;
+  assert.equal(extContext.syncExternal(scope), false);
+  assert.equal(calls.length, 2);
+}
 class FakeVirtualElement {
   constructor({ isView = false, rect = null } = {}) {
     this.isView = isView;
@@ -2101,6 +2163,14 @@ assert.ok(
   'before-paint blacklist pass must cover both post and comment roots'
 );
 assert.match(hideWithoutRestoreSource, /hideBlockedSearchResultCards\(root\)/);
+
+// 每批 DOM 变更、绘制前隐藏与过滤主流程都核对被外部样式整行隐藏的行。
+assert.match(hideBeforePaintSource, /syncExternallyHiddenVirtualRows\(root\)/);
+assert.match(contentFilterSource, /syncExternallyHiddenVirtualRows\(document\);/);
+assert.match(
+  sourceBetween('  function hideBlockedDOMPosts(', '  function queueBlockedDOMRefresh('),
+  /syncVirtualRowMeasurementShells\(document\);\s*syncExternallyHiddenVirtualRows\(document\);/
+);
 
 const recycledShellSource = sourceBetween(
   '  function restoreRecycledVirtualContentShells(',
