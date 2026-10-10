@@ -95,125 +95,261 @@ assert.equal(
   false
 );
 assert.equal(
-  (source.match(/const parsed = parseFilteredUsersResponse\(data,/g) || []).length,
-  3
+  filteredUsersParserContext.parseFilteredUsers(
+    { ok: 1, card_group: [{}], next_cursor: 1, total: 20039 },
+    '测试'
+  ).total,
+  20039
 );
+
+// ═══ 新浪微博官方黑名单同步：同步新增与可续传的完整同步 ═══
 const filteredUsersPaginationSource = sourceBetween(
   '  function extractUIDFromScheme(item) {',
   '  let BL = new Set();'
 );
-const paginationRequests = [];
-let paginationResponses = [];
-const filteredUsersPaginationContext = vm.createContext({
-  MAX_418: 3,
-  MAX_FULL_SYNC_PAGES: 20,
+const syncStore = new Map();
+const syncRequests = [];
+const syncCommits = [];
+let syncResponder = () => {
+  throw new Error('no responder');
+};
+const syncScheme = (uid) => ({ scheme: `sinaweibo://userinfo?uid=${uid}` });
+const syncPageData = (uids, { last = false, total } = {}) => ({
+  ok: 1,
+  card_group: uids.map(syncScheme),
+  next_cursor: last ? 0 : 1,
+  ...(total === undefined ? {} : { total }),
+});
+const syncContext = vm.createContext({
+  MAX_FULL_SYNC_PAGES: 50,
   SETTING_API_HOST_ERROR: 'host error',
   THROTTLE_MS: 350,
+  UID_KEY: 'WB_BL_list',
+  UID_EXCLUSION_KEY: 'WB_BL_local_exclusions',
+  BL: new Set(),
+  Date,
+  console,
   WB_BL_NATIVE: {
     fetch: async (url) => {
-      paginationRequests.push(url);
-      const data = paginationResponses.shift();
-      if (!data) throw new Error(`unexpected request: ${url}`);
-      return {
-        ok: true,
-        status: 200,
-        json: async () => data,
-      };
+      syncRequests.push(url);
+      const page = Number(String(url).match(/page=(\d+)/)[1]);
+      const reply = syncResponder(page);
+      if (typeof reply === 'number') {
+        return { ok: false, status: reply, json: async () => ({}) };
+      }
+      return { ok: true, status: 200, json: async () => reply };
     },
   },
   canUseSettingApi: () => true,
-  commitSyncedLocalBL: async (workingSet) => new Set(workingSet),
-  readLocalBLExclusions: () => new Set(),
+  createSyncAbortError: () => Object.assign(new Error('aborted'), { name: 'AbortError' }),
+  throwIfSyncAborted: () => {},
+  sleep: async () => {},
   replaceSetContents: (target, values) => {
+    const next = Array.from(values);
     target.clear();
-    values.forEach((value) => target.add(value));
+    next.forEach((value) => target.add(value));
     return target;
   },
-  sleep: async () => {},
-  throwIfSyncAborted: () => {},
+  parseStoredUIDSet: (raw) =>
+    new Set(
+      String(raw || '')
+        .split(',')
+        .map((uid) => uid.trim())
+        .filter((uid) => /^\d{5,}$/.test(uid))
+    ),
+  readLocalBLExclusions: () =>
+    new Set(String(syncStore.get('WB_BL_local_exclusions') || '').split(',').filter(Boolean)),
+  withLocalBLMutationLock: async (task) => task(),
+  commitSyncedLocalBL: async (workingSet, baseExclusions, workingExclusions) => {
+    syncCommits.push(Array.from(workingSet));
+    const bl = syncContext.BL;
+    workingSet.forEach((uid) => {
+      if (!workingExclusions.has(uid)) bl.add(uid);
+    });
+    syncStore.set('WB_BL_list', Array.from(bl).join(','));
+    syncStore.set('WB_BL_local_exclusions', Array.from(workingExclusions).join(','));
+    return new Set(bl);
+  },
+  _GM_getValue: (key, fallback) => (syncStore.has(key) ? syncStore.get(key) : fallback),
+  _GM_setValue: (key, value) => syncStore.set(key, value),
+  _GM_deleteValue: (key) => syncStore.delete(key),
 });
 vm.runInContext(
   `${filteredUsersPaginationSource}
-  globalThis.testFilteredUsersPagination = { fullSync, deltaSync, syncPages };`,
-  filteredUsersPaginationContext
+  globalThis.testOfficialSync = { syncNewOfficialUIDs, fullSync, getFullSyncResumeInfo };`,
+  syncContext
 );
-const paginationAPI =
-  filteredUsersPaginationContext.testFilteredUsersPagination;
-const pagedResponses = () => [
-  {
-    ok: 1,
-    card_group: [{ scheme: 'sinaweibo://userinfo?uid=10001' }],
-    next_cursor: 1,
-    total: 3,
-  },
-  {
-    ok: 1,
-    card_group: [{ scheme: 'sinaweibo://userinfo?uid=10002' }],
-    next_cursor: 1,
-    total: 3,
-  },
-  {
-    ok: 1,
-    card_group: [{ scheme: 'sinaweibo://userinfo?uid=10003' }],
-    next_cursor: 0,
-    total: 3,
-  },
-];
+const officialSync = syncContext.testOfficialSync;
+const resetSync = (localUIDs = [], extra = {}) => {
+  syncStore.clear();
+  syncRequests.length = 0;
+  syncCommits.length = 0;
+  syncContext.BL.clear();
+  localUIDs.forEach((uid) => syncContext.BL.add(uid));
+  syncStore.set('WB_BL_list', localUIDs.join(','));
+  Object.entries(extra).forEach(([key, value]) => syncStore.set(key, value));
+};
+const requestedPages = () =>
+  syncRequests.map((url) => Number(String(url).match(/page=(\d+)/)[1]));
 
-paginationResponses = pagedResponses();
-paginationRequests.length = 0;
-const fullSyncResult = await paginationAPI.fullSync();
-assert.deepEqual(Array.from(fullSyncResult), ['10001', '10002', '10003']);
-assert.deepEqual(paginationRequests, [
-  '/ajax/setting/getFilteredUsers?page=1',
-  '/ajax/setting/getFilteredUsers?page=2',
-  '/ajax/setting/getFilteredUsers?page=3',
-]);
-assert.equal(
-  paginationRequests.some((url) => url.includes('cursor=')),
-  false,
-  'official blacklist pagination must use page numbers only'
-);
+{
+  // 同步新增：遇到整页都已在本地名单里即停止。
+  resetSync(['20003', '20004']);
+  syncResponder = (page) =>
+    ({
+      1: syncPageData(['20001', '20002']),
+      2: syncPageData(['20003', '20004']),
+      3: syncPageData(['20005']),
+    })[page];
+  let result = await officialSync.syncNewOfficialUIDs(syncContext.BL, {});
+  assert.deepEqual(requestedPages(), [1, 2]);
+  assert.equal(result.added, 2);
+  assert.equal(result.caughtUp, true);
+  assert.equal(
+    syncRequests.some((url) => url.includes('cursor=')),
+    false,
+    'official blacklist pagination must use page numbers only'
+  );
+  assert.deepEqual(
+    String(syncStore.get('WB_BL_official_seen')).split(',').sort(),
+    ['20001', '20002', '20003', '20004']
+  );
 
-paginationResponses = pagedResponses();
-paginationRequests.length = 0;
-const pagedSyncSet = new Set();
-assert.equal(await paginationAPI.syncPages(pagedSyncSet, 5), 3);
-assert.deepEqual(Array.from(pagedSyncSet), ['10001', '10002', '10003']);
-assert.deepEqual(paginationRequests, [
-  '/ajax/setting/getFilteredUsers?page=1',
-  '/ajax/setting/getFilteredUsers?page=2',
-  '/ajax/setting/getFilteredUsers?page=3',
-]);
+  // 启动时静默运行最多 3 页，并保留本地删除。
+  resetSync([], { WB_BL_local_exclusions: '30001' });
+  syncResponder = (page) => syncPageData([`3000${page}`, `3100${page}`]);
+  result = await officialSync.syncNewOfficialUIDs(syncContext.BL, { silent: true });
+  assert.deepEqual(requestedPages(), [1, 2, 3]);
+  assert.equal(result.caughtUp, false);
+  assert.equal(syncContext.BL.has('30001'), false, 'startup sync must keep local deletions');
+  assert.equal(syncContext.BL.has('31001'), true);
+  // 手动运行把官方名单里的 UID 重新加入本地。
+  resetSync([], { WB_BL_local_exclusions: '30001' });
+  syncResponder = (page) => syncPageData(['30001'], { last: page === 1 });
+  await officialSync.syncNewOfficialUIDs(syncContext.BL, {});
+  assert.equal(syncContext.BL.has('30001'), true);
+  // 空页即停止，即使游标仍为真值。
+  resetSync();
+  syncResponder = () => syncPageData([]);
+  await officialSync.syncNewOfficialUIDs(syncContext.BL, {});
+  assert.deepEqual(requestedPages(), [1]);
 
-paginationResponses = [
-  {
-    ok: 1,
-    card_group: [{ scheme: 'sinaweibo://userinfo?uid=10004' }],
-    next_cursor: 1,
-  },
-];
-paginationRequests.length = 0;
-const deltaSet = await paginationAPI.deltaSync(new Set());
-assert.deepEqual(Array.from(deltaSet), ['10004']);
-assert.deepEqual(paginationRequests, [
-  '/ajax/setting/getFilteredUsers?page=1',
-]);
+  // 前几页全部已知、后面是一段缺口：官方总数比上次同步时多出的部分所在的页
+  // 必须读完，不能在第一个已知整页就停下。
+  resetSync(['70001', '70002'], { WB_BL_official_synced_total: 100 });
+  syncResponder = (page) =>
+    ({
+      1: syncPageData(['70001', '70002'], { total: 104 }),
+      2: syncPageData(['70003', '70004'], { total: 104 }),
+      3: syncPageData(['70005', '70006'], { total: 104 }),
+      4: syncPageData(['70001'], { total: 104 }),
+    })[page] || syncPageData(['79999'], { total: 104 });
+  result = await officialSync.syncNewOfficialUIDs(syncContext.BL, {});
+  assert.deepEqual(requestedPages(), [1, 2, 3, 4]);
+  assert.equal(result.added, 4);
+  assert.equal(syncStore.get('WB_BL_official_synced_total'), 104);
+  // 读到上限仍有新增时保持旧基准，下次同步继续覆盖差额。
+  resetSync([], { WB_BL_official_synced_total: 100 });
+  syncResponder = (page) => syncPageData([`7100${page}`], { total: 200 });
+  result = await officialSync.syncNewOfficialUIDs(syncContext.BL, { silent: true });
+  assert.equal(result.caughtUp, false);
+  assert.equal(syncStore.get('WB_BL_official_synced_total'), 100);
 
-paginationResponses = [
-  {
-    ok: 1,
-    card_group: [],
-    next_cursor: 1,
-  },
-];
-paginationRequests.length = 0;
-assert.equal(await paginationAPI.syncPages(new Set(), 5), 0);
-assert.equal(
-  paginationRequests.length,
-  1,
-  'an empty page must terminate pagination even when next_cursor stays truthy'
-);
+  // 完整同步：读完全部分页，删除官方已取消拉黑的 UID，只在本地屏蔽的保留。
+  resetSync(['40009', '49999'], { WB_BL_official_seen: '40009' });
+  syncResponder = (page) =>
+    ({
+      1: syncPageData(['40001', '40002'], { total: 4 }),
+      2: syncPageData(['40003', '40004'], { total: 4, last: true }),
+    })[page];
+  result = await officialSync.fullSync({});
+  assert.deepEqual(requestedPages(), [1, 2]);
+  assert.equal(result.complete, true);
+  assert.equal(result.added, 4);
+  assert.equal(result.removed, 1);
+  assert.equal(syncContext.BL.has('40009'), false, 'officially unblocked UIDs must be removed locally');
+  assert.equal(syncContext.BL.has('49999'), true, 'local-only UIDs must be kept');
+  assert.equal(result.localOnly, 1);
+  assert.deepEqual(
+    String(syncStore.get('WB_BL_official_seen')).split(',').sort(),
+    ['40001', '40002', '40003', '40004']
+  );
+  assert.equal(syncStore.has('WB_BL_full_sync_progress'), false);
+  assert.equal(syncStore.get('WB_BL_official_synced_total'), 4);
+
+  // 读到的数量少于官方总数时（名单在同步期间变化），不删除任何 UID。
+  resetSync(['40009'], { WB_BL_official_seen: '40009' });
+  syncResponder = () => syncPageData(['40001'], { total: 5, last: true });
+  result = await officialSync.fullSync({});
+  assert.equal(result.complete, false);
+  assert.equal(result.removed, 0);
+  assert.equal(syncContext.BL.has('40009'), true);
+
+  // 接口偶尔返回错位的一页：第 2 页先返回包含第 1 页末尾 UID 的结果，漏掉
+  // 40003。读完之后重读异常页及相邻页，补上漏掉的 UID，数量对上之后才删除。
+  resetSync(['40009'], { WB_BL_official_seen: '40009' });
+  let shiftedOnce = false;
+  syncResponder = (page) => {
+    if (page === 1) return syncPageData(['40001', '40002'], { total: 6 });
+    if (page === 2) {
+      if (!shiftedOnce) {
+        shiftedOnce = true;
+        return syncPageData(['40002', '40004'], { total: 6 });
+      }
+      return syncPageData(['40003', '40004'], { total: 6 });
+    }
+    return syncPageData(['40005', '40006'], { total: 6, last: true });
+  };
+  result = await officialSync.fullSync({});
+  assert.deepEqual(requestedPages(), [1, 2, 3, 1, 2]);
+  assert.equal(result.complete, true, 'repair pass must recover UIDs lost to a shifted page');
+  assert.equal(syncContext.BL.has('40003'), true);
+  assert.equal(result.removed, 1);
+
+  // 接口以 HTTP 200 返回 ok: 0（实测「获取屏蔽设置失败！」）时同样退避重试。
+  resetSync();
+  let softFailures = 0;
+  syncResponder = (page) => {
+    if (page === 1 && softFailures++ < 2) return { ok: 0, msg: '获取屏蔽设置失败！' };
+    return syncPageData(['50002'], { total: 1, last: true });
+  };
+  result = await officialSync.fullSync({});
+  assert.deepEqual(requestedPages(), [1, 1, 1]);
+  assert.equal(result.complete, true);
+
+  // 418 与 5xx 按退避重试，成功后继续。
+  resetSync();
+  let throttled = 0;
+  syncResponder = (page) => {
+    if (page === 1 && throttled++ < 2) return 418;
+    return syncPageData(['50001'], { total: 1, last: true });
+  };
+  result = await officialSync.fullSync({});
+  assert.deepEqual(requestedPages(), [1, 1, 1]);
+  assert.equal(result.complete, true);
+
+  // 中途失败：已读到的 UID 先写入本地，断点记在失败的页，下次从该页继续。
+  resetSync();
+  syncResponder = (page) => {
+    if (page <= 12) return syncPageData([`6${String(page).padStart(4, '0')}`], { total: 14 });
+    return 500;
+  };
+  await assert.rejects(officialSync.fullSync({}), /已暂停/);
+  assert.equal(syncContext.BL.size, 12, 'pages read before the failure must already be saved');
+  assert.equal(syncCommits.length, 2, 'progress must be committed every 10 pages and on failure');
+  const resumeInfo = officialSync.getFullSyncResumeInfo();
+  assert.equal(resumeInfo.nextPage, 13);
+  assert.equal(resumeInfo.loaded, 12);
+  syncRequests.length = 0;
+  syncResponder = (page) =>
+    syncPageData([`6${String(page).padStart(4, '0')}`], { total: 14, last: page === 14 });
+  result = await officialSync.fullSync({});
+  assert.deepEqual(requestedPages(), [13, 14]);
+  assert.equal(result.resumedFromPage, 13);
+  assert.equal(result.complete, true);
+  assert.equal(syncContext.BL.size, 14);
+  assert.equal(officialSync.getFullSyncResumeInfo(), null);
+}
 const observerSource = sourceBetween(
   '      observer.observe(root, {',
   '    function subscribeMutations('
@@ -561,7 +697,8 @@ assert.ok(
     source.indexOf("const WB_CONFIG_KEY = 'cfg'"),
   'official blacklist request pacing must remain visible to the settings scope'
 );
-assert.equal((source.match(/await sleep\(THROTTLE_MS, signal\)/g) || []).length, 2);
+// 同步新增、完整同步、完整同步的补读，三处分页请求之间都按固定间隔等待。
+assert.equal((source.match(/await sleep\(THROTTLE_MS, signal\)/g) || []).length, 3);
 assert.match(
   source,
   /data-wbset-page="blacklist">屏蔽设置<\/button>/
@@ -587,9 +724,15 @@ assert.match(source, /async function withLocalBLMutationLock\(task\)/);
 assert.match(source, /confirmed\?\.owner === owner/);
 assert.match(source, /async function mutateLocalBLStorage\(options = \{\}\)/);
 assert.match(source, /async function commitSyncedLocalBL\(/);
+// 「增量同步」只读第 1 页、「同步前 5 页」只读前 5 页，两者都不是增量，已由
+// 「同步新增」取代。
+assert.doesNotMatch(source, /增量同步|同步前 ?5 ?页|wbset-sync-delta|wbset-sync-five/);
+assert.match(source, /id="wbset-sync-new">同步新增<\/button>/);
+assert.match(source, /syncNewOfficialUIDs\(BL, \{ \.\.\.controls, silent: true \}\)/);
+// 同步新增与完整同步（含分批保存）各经一次加锁合并写入本地名单。
 assert.equal(
   (source.match(/await commitSyncedLocalBL\(/g) || []).length,
-  3
+  2
 );
 assert.match(settingsSource, /function isTrustedSettingsEvent\(event\)/);
 assert.match(
@@ -667,8 +810,8 @@ assert.match(
   source,
   /hideTimelineRecommendations:\s*true/
 );
-assert.match(source, /@version\s+2\.4\.56/);
-assert.match(source, /const SCRIPT_VERSION = '2\.4\.56'/);
+assert.match(source, /@version\s+3\.0\.0/);
+assert.match(source, /const SCRIPT_VERSION = '3\.0\.0'/);
 // 元数据版本号与运行时常量必须始终一致，否则设置面板会显示错误版本。
 assert.equal(
   source.match(/@version\s+(\S+)/)?.[1],
@@ -1915,6 +2058,50 @@ assert.equal(
   fakeContentShell,
   'even a virtual-view root must resolve to its inner content shell'
 );
+// 新增节点必须在 MutationObserver 回调里同步完成隐藏。回调早于绘制执行；留到
+// 60ms 的批处理时，被屏蔽用户的评论、广告与推荐内容会先绘制出来再消失。
+const contentFilterSource = sourceBetween(
+  '  // === MutationObserver 过滤 ===',
+  "  window.addEventListener('scroll', checkTimelinePaginationOnScroll, {"
+);
+assert.match(
+  contentFilterSource,
+  /subscribeMutations\('content-filter', \(mutations\) => \{\s*hideBeforePaint\(mutations\);\s*pendingMutations\.push/
+);
+const hideBeforePaintSource = sourceBetween(
+  '    const hideBeforePaint = (mutations) => {',
+  '    const processMutations = () => {'
+);
+for (const call of [
+  'hideRecognizedAds(root)',
+  'hideTimelineRecommendations(root)',
+  'hideBlockedContentWithoutRestore(root)',
+]) {
+  assert.ok(hideBeforePaintSource.includes(call), `before-paint pass must call ${call}`);
+}
+// 前置隐藏只增不减：恢复判定依赖 uid 标记，Vue 重新渲染期间标记可能短暂缺失，
+// 必须留给批处理在传入范围内完成。
+assert.doesNotMatch(
+  hideBeforePaintSource,
+  /restoreRecycled|clearOwnBlockedContentHideState|removeAttribute/
+);
+// Vue 复用虚拟行时只改属性、不插入节点，属性变更同样要进入前置隐藏，已隐藏的
+// 壳交给批处理复核。
+assert.match(hideBeforePaintSource, /IDENTITY_ATTRIBUTE_NAMES\.has\(mutation\.attributeName\)/);
+assert.match(hideBeforePaintSource, /pendingRecycledShells\.add\(hiddenShell\)/);
+assert.match(contentFilterSource, /recycledShells\.forEach\(\(shell\) => \{[\s\S]*?refreshBlockedContent\(shell\)/);
+// 黑名单前置隐藏与 refreshBlockedContent 一样成对覆盖微博侧与评论侧。
+const hideWithoutRestoreSource = sourceBetween(
+  '  function hideBlockedContentWithoutRestore(root) {',
+  '  function nudgeTimelineLayout() {'
+);
+assert.ok(
+  hideWithoutRestoreSource.indexOf('findContentRootForUID(el, blockedUID)') <
+    hideWithoutRestoreSource.indexOf('findCommentRootForUID(el, blockedUID)'),
+  'before-paint blacklist pass must cover both post and comment roots'
+);
+assert.match(hideWithoutRestoreSource, /hideBlockedSearchResultCards\(root\)/);
+
 const recycledShellSource = sourceBetween(
   '  function restoreRecycledVirtualContentShells(',
   '  function hideBlockedDOMPosts('
@@ -2922,8 +3109,13 @@ assert.ok(
 reconcileMountedTab = reconcileLatestTab;
 runReconcileTick(250);
 assert.equal(reconcileLatestTab.clicks, 1);
-// 点击未使路由离开根路由时继续重试，这正是选中类名判断会漏掉的中间态。
+// 点击后选中类名先变、路由数百毫秒后才变。这段时间里再点一次落在已选中的
+// 分栏上，只消耗点击次数，因此在切换的结算窗口内不重复点击。
 runReconcileTick(400);
+assert.equal(reconcileLatestTab.clicks, 1);
+assert.match(forceLatestTabSource, /RECONCILE_SWITCH_SETTLE_MS = 1500/);
+// 超过结算窗口路由仍停在根路由时继续重试，这正是选中类名判断会漏掉的中间态。
+runReconcileTick(1200);
 assert.equal(reconcileLatestTab.clicks, 2);
 // 巡检自身也以路由为准：即便没有路由事件，检查到已离开根路由同样收手。
 reconcileLocation.pathname = '/mygroups';
@@ -2966,6 +3158,7 @@ const rewriteLocation = {
 };
 const rewriteLatestTab = new FakeTimelineTab('最新微博');
 let rewriteMountedTab = null;
+let rewriteRouteHandler = null;
 const rewriteContext = vm.createContext({
   WB_INTERNAL: {
     dom: {
@@ -2975,7 +3168,9 @@ const rewriteContext = vm.createContext({
       cancel(channel) {
         return rewriteScheduled.delete(channel);
       },
-      subscribeRoute() {},
+      subscribeRoute(channel, callback) {
+        rewriteRouteHandler = callback;
+      },
       subscribeMutations(channel, callback) {
         rewriteMutationSubs.set(channel, callback);
         return () => rewriteMutationSubs.delete(channel);
@@ -3056,6 +3251,31 @@ rewriteScheduled.get('timeline-tab-reconcile')();
 assert.equal(rewriteScheduled.has('timeline-tab-reconcile'), false);
 assert.equal(rewriteLatestTab.clicks, 0);
 assert.equal(rewriteStore.WB_latest_timeline_gid, '110001635218563');
+// 改写标记只属于本次加载的首次落地。用户之后选了「特别关注」、去个人主页、
+// 再按返回回到该分组时，不得被当成刚改写过地址而点回「最新微博」。
+rewriteLatestTab.selected = false;
+rewriteLocation.pathname = '/u/1635218563';
+rewriteLocation.search = '';
+rewriteRouteHandler();
+rewriteLocation.pathname = '/mygroups';
+rewriteLocation.search = '?gid=3412151421608623';
+rewriteRouteHandler();
+assert.equal(rewriteScheduled.has('timeline-tab-reconcile'), false);
+assert.equal(rewriteLatestTab.clicks, 0);
+assert.match(
+  forceLatestTabSource,
+  /if \(!isHomeRootRoute\(\) && !rewriteArrivalPending\) return;/
+);
+// 分栏条挂载之前就离开首页时，校验计时器到点也不能据此清掉 gid 并跳回首页。
+assert.match(
+  forceLatestTabSource,
+  /function verifyRewrittenRoute\(\) \{\s*if \(!rewroteRootRoute\) return;[\s\S]*?if \(!isHomeTimelineRoute\(\)\) \{\s*rewroteRootRoute = false;\s*return;/
+);
+// 页面重新可见时仍停在根路由，补开一次会话。
+assert.match(
+  forceLatestTabSource,
+  /document\.addEventListener\('visibilitychange', retryReconcileAtRoot\)/
+);
 
 // 地址已经是分组路由，微博前端却按「全部关注」启动：选中态停在「全部关注」，
 // 时间线接口也不按该分组请求。只看路由会误判为已经到位，此时必须点击切换。
@@ -3154,6 +3374,226 @@ assert.equal(
   1,
   'a rewritten route that still boots into another tab must be clicked over'
 );
+
+// 切换遮罩与内容校验。站内回到首页时，微博先渲染「全部关注」；遮罩把时间线
+// 列表设为不可见，直到点击之后发起的「最新微博」内容请求完成。另一方面，地址
+// 与高亮都已是「最新微博」时，微博仍可能请求「全部关注」的内容，此时必须点击。
+function createFeedGuardHarness({ pathname, search, latestSelected }) {
+  const scheduled = new Map();
+  const routes = new Map();
+  const attrs = new Map();
+  const appended = [];
+  let perfTime = 1000;
+  let feedObserver = null;
+  const loc = {
+    hostname: 'weibo.com',
+    pathname,
+    search,
+    origin: 'https://weibo.com',
+    replace() {},
+  };
+  const latest = new FakeTimelineTab('最新微博');
+  const allFollowing = new FakeTimelineTab('全部关注');
+  const special = new FakeTimelineTab('特别关注');
+  latest.selected = latestSelected;
+  allFollowing.selected = !latestSelected;
+  latest.link = {
+    getAttribute: (name) =>
+      name === 'href' ? '/mygroups?gid=110001635218563' : null,
+  };
+  let mounted = true;
+  const context = vm.createContext({
+    WB_INTERNAL: {
+      dom: {
+        schedule(channel, callback) {
+          scheduled.set(channel, callback);
+        },
+        cancel(channel) {
+          return scheduled.delete(channel);
+        },
+        subscribeRoute(channel, callback) {
+          routes.set(channel, callback);
+        },
+        subscribeMutations() {
+          return () => {};
+        },
+      },
+    },
+    document: {
+      documentElement: {
+        setAttribute: (name, value) => attrs.set(name, value),
+        removeAttribute: (name) => attrs.delete(name),
+        hasAttribute: (name) => attrs.has(name),
+      },
+      head: { appendChild: (node) => appended.push(node) },
+      visibilityState: 'visible',
+      getElementById: () => null,
+      createElement: () => ({}),
+      addEventListener() {},
+      querySelector(selector) {
+        if (!mounted) return null;
+        if (selector.includes('最新微博')) return latest;
+        if (selector.includes('全部关注')) return allFollowing;
+        if (selector.includes('特别关注')) return special;
+        return null;
+      },
+    },
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    PerformanceObserver: class {
+      constructor(callback) {
+        feedObserver = callback;
+      }
+      observe() {}
+    },
+    performance: { now: () => perfTime },
+    URL,
+    HTMLElement: FakeTimelineTab,
+    Element: FakeTimelineTab,
+    Date: { now: () => 1000000 + perfTime },
+    location: loc,
+    history: { replaceState() {} },
+    GM_getValue: (key, fallback) =>
+      key === 'WB_latest_timeline_gid' ? '110001635218563' : fallback,
+    GM_setValue() {},
+    GM_deleteValue() {},
+    TIMELINE_TAB_TITLES: ['全部关注', '最新微博', '特别关注', '好友圈', '悄悄关注'],
+    timelineDefault: { value: true },
+    hasOfficialBlockRelayRequest: () => false,
+    isTrustedUserEvent: () => true,
+    syncRelationshipPageMode() {},
+  });
+  vm.runInContext(
+    `${sourceBetween(
+      '  function findTimelineTabElement(title) {',
+      '  WB_INTERNAL.timelineTabs = Object.freeze({'
+    )}
+    ${forceLatestTabSource}`,
+    context
+  );
+  return {
+    loc,
+    latest,
+    allFollowing,
+    special,
+    scheduled,
+    routes,
+    masked: () => attrs.has('data-__wb_latest_timeline_pending'),
+    advance(ms) {
+      perfTime += ms;
+    },
+    now: () => perfTime,
+    setMounted(value) {
+      mounted = value;
+    },
+    feed(path, startTime, responseEnd = startTime) {
+      feedObserver({
+        getEntries: () => [
+          {
+            name: `https://weibo.com/ajax/feed/${path}?list_id=1`,
+            startTime,
+            responseEnd,
+          },
+        ],
+      });
+    },
+    run(channel) {
+      const task = scheduled.get(channel);
+      scheduled.delete(channel);
+      if (task) task();
+    },
+  };
+}
+
+// 地址与高亮都是「最新微博」，内容请求却是「全部关注」：点击并遮罩，等新的
+// 分组时间线请求完成后撤掉遮罩。
+const mismatch = createFeedGuardHarness({
+  pathname: '/mygroups',
+  search: '?gid=110001635218563',
+  latestSelected: true,
+});
+mismatch.advance(50);
+mismatch.feed('unreadfriendstimeline', mismatch.now());
+assert.equal(mismatch.latest.clicks, 1, 'all-following content on the latest route must be clicked over');
+assert.equal(mismatch.masked(), true);
+// 点击之前发起的分组请求不能放行遮罩。
+mismatch.feed('friendstimeline', mismatch.now() - 10);
+assert.equal(mismatch.scheduled.has('timeline-latest-mask-release'), false);
+mismatch.advance(400);
+mismatch.feed('friendstimeline', mismatch.now() - 100);
+mismatch.run('timeline-latest-mask-release');
+assert.equal(mismatch.masked(), false, 'mask must lift once the latest feed request completes');
+// 每次到达最多补点两次，避免接口行为变化时反复刷新列表。
+mismatch.feed('unreadfriendstimeline', mismatch.now());
+mismatch.feed('unreadfriendstimeline', mismatch.now());
+assert.equal(mismatch.latest.clicks, 2);
+// 早于当前地址生效时刻发起的「全部关注」请求属于上一个地址，不作处理。
+const staleFeed = createFeedGuardHarness({
+  pathname: '/mygroups',
+  search: '?gid=110001635218563',
+  latestSelected: true,
+});
+staleFeed.advance(500);
+staleFeed.routes.get('timeline-default')();
+staleFeed.feed('unreadfriendstimeline', staleFeed.now() - 300, staleFeed.now() - 100);
+assert.equal(staleFeed.latest.clicks, 0);
+// 发起早于地址生效、返回晚于地址生效的请求，结果落在当前分栏上，同样需要纠正。
+staleFeed.feed('unreadfriendstimeline', staleFeed.now() - 100, staleFeed.now() + 50);
+assert.equal(staleFeed.latest.clicks, 1, 'an all-following response landing after the switch must be corrected');
+// 用户自己停在其他分组时不介入。
+const ownGroup = createFeedGuardHarness({
+  pathname: '/mygroups',
+  search: '?gid=3412151421608623',
+  latestSelected: false,
+});
+ownGroup.allFollowing.selected = false;
+ownGroup.special.selected = true;
+ownGroup.advance(50);
+ownGroup.feed('unreadfriendstimeline', ownGroup.now());
+assert.equal(ownGroup.latest.clicks, 0);
+
+// 站内回到根路由：会话开始即遮罩；到位之后仍保持遮罩，直到点击之后发起的
+// 「最新微博」内容请求完成。
+const spaArrival = createFeedGuardHarness({
+  pathname: '/u/1635218563',
+  search: '',
+  latestSelected: false,
+});
+spaArrival.setMounted(false);
+spaArrival.loc.pathname = '/';
+spaArrival.advance(10);
+spaArrival.routes.get('timeline-default')();
+assert.equal(spaArrival.masked(), true, 'arriving at the root route must mask the timeline list');
+spaArrival.setMounted(true);
+spaArrival.advance(400);
+spaArrival.run('timeline-tab-reconcile');
+assert.equal(spaArrival.latest.clicks, 1);
+spaArrival.latest.selected = true;
+spaArrival.loc.pathname = '/mygroups';
+spaArrival.loc.search = '?gid=110001635218563';
+spaArrival.advance(400);
+spaArrival.run('timeline-tab-reconcile');
+assert.equal(spaArrival.scheduled.has('timeline-tab-reconcile'), false);
+assert.equal(spaArrival.masked(), true, 'mask must stay until the latest content has loaded');
+spaArrival.advance(600);
+spaArrival.feed('friendstimeline', spaArrival.now() - 900);
+spaArrival.run('timeline-latest-mask-release');
+assert.equal(spaArrival.masked(), false);
+// 遮罩有时长上限，切换失败时内容照样显示。
+assert.match(forceLatestTabSource, /LATEST_MASK_MAX_MS = 5000/);
+const capped = createFeedGuardHarness({
+  pathname: '/u/1635218563',
+  search: '',
+  latestSelected: false,
+});
+capped.setMounted(false);
+capped.loc.pathname = '/';
+capped.routes.get('timeline-default')();
+assert.equal(capped.masked(), true);
+capped.run('timeline-latest-mask-cap');
+assert.equal(capped.masked(), false);
 
 // gid 失效时，改写把页面带到一个打不开的地址。分栏条始终不出现，校验到期后
 // 清掉 gid 并回到根路由，下一次加载没有 gid 可用，自动退回点击纠正。
@@ -3383,6 +3823,7 @@ assert.doesNotMatch(contentObserverSource, /args\[\d\]\s*=/);
 
 const adRuntime = {
   refreshCalls: 0,
+  immediateAdScans: 0,
 };
 const adContext = vm.createContext({
   CONTENT_FILTER_CFG: {
@@ -3398,6 +3839,9 @@ const adContext = vm.createContext({
   location: { origin: 'https://weibo.com' },
   queueBlockedDOMRefresh: () => {
     adRuntime.refreshCalls += 1;
+  },
+  hideRecognizedAds: () => {
+    adRuntime.immediateAdScans += 1;
   },
 });
 vm.runInContext(
@@ -3681,11 +4125,14 @@ const adPayload = JSON.stringify({
 // 回包可能晚于卡片渲染到达，登记表新增条目时必须补一次 DOM 扫描。
 adAPI.AD_POST_OWNERS.clear();
 adRuntime.refreshCalls = 0;
+adRuntime.immediateAdScans = 0;
 adAPI.observeContentResponse(
   'https://weibo.com/ajax/feed/friendstimeline',
   adPayload
 );
 assert.equal(adRuntime.refreshCalls, 1);
+// 卡片先于回包渲染时，不等 60ms 的完整刷新，立即补扫一次广告。
+assert.equal(adRuntime.immediateAdScans, 1);
 // 同一批回包重复到达时不再重复触发扫描。
 adAPI.observeContentResponse(
   'https://weibo.com/ajax/feed/friendstimeline',

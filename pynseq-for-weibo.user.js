@@ -4,7 +4,7 @@
 // @name:zh-CN   Pynseq for Weibo｜屏序·微博｜本地屏蔽名单与时间线控制｜屏蔽热搜
 // @name:en      Pynseq for Weibo｜屏序·微博｜本地屏蔽名单与时间线控制｜屏蔽热搜
 // @namespace    https://github.com/DanielZenFlow/Pynseq-Weibo
-// @version      2.4.56
+// @version      3.0.0
 // @description  模仿早期 Twitter 的时间线展示，支持默认进入最新微博、按本地屏蔽列表隐藏内容、过滤广告、精简导航和侧栏，并提供新浪微博官方黑名单同步及本地列表管理。
 // @description:en Restore a chronological Weibo timeline, locally block unwanted users, filter ads, simplify navigation, and manage official Weibo blocklist synchronization.
 // @author       DanielZenFlow
@@ -41,7 +41,7 @@
   const WB_INTERNAL = Object.create(null);
   const THROTTLE_MS = 350; // 新浪微博官方黑名单分页请求间隔（毫秒）
   const SCRIPT_NAME = 'Pynseq for Weibo｜屏序·微博';
-  const SCRIPT_VERSION = '2.4.56';
+  const SCRIPT_VERSION = '3.0.0';
   const GITHUB_URL = 'https://github.com/DanielZenFlow/Pynseq-Weibo';
   const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/danielzenflow';
   const ONBOARDING_DONE_KEY = 'pynseq_for_weibo_onboarding_done_v1';
@@ -960,6 +960,11 @@
     const RECONCILE_BUDGET_MS = 20000;
     const RECONCILE_MAX_CLICKS = 12;
     const RECONCILE_MIN_CLICK_GAP_MS = 350;
+    // 点击之后微博先切换选中类名，路由要等数百毫秒才更新，主线程繁忙时更久。
+    // 这段时间里「最新微博」已是选中态而地址仍是根路由，再点一次落在已选中的
+    // 分栏上，不推进切换，只消耗点击次数。超过该时长仍未到位，才视为前端停在
+    // 「选中态指向最新微博、内容仍是全部关注」的状态，重新点击。
+    const RECONCILE_SWITCH_SETTLE_MS = 1500;
     const RECONCILE_TICK_MS = 250;
     const RECONCILE_MIN_TICK_GAP_MS = 50;
     const RECONCILE_CHANNEL = 'timeline-tab-reconcile';
@@ -1028,6 +1033,10 @@
     // 类名判断会把这种状态读成"已经到位"并就此收手。
     let session = null;
     let rewroteRootRoute = false;
+    // 改写地址只说明本次加载的首次落地应当是「最新微博」，由第一次会话消费，
+    // 不能沿用到之后的站内跳转：否则从个人主页返回用户自己选过的「特别关注」
+    // 等分组时，也会被当成刚改写过地址，被点回「最新微博」。
+    let rewriteArrivalPending = false;
     // 一次"落在首页"只开一次会话；换到别的 pathname 之后再回来才会再开一次。
     let homeArrivalHandled = false;
     let lastHomePath = '';
@@ -1041,20 +1050,182 @@
       !isHomeRootRoute() &&
       isTimelineTabActive(findTimelineTabElement(LATEST_TITLE));
 
-    const endReconcile = () => {
+    // === 切换期间的时间线遮罩 ===
+    // 站内回到首页时，微博先按「全部关注」渲染并请求它的内容，脚本点击之后
+    // 「最新微博」的内容约一秒后才到。遮罩在这段时间里把时间线列表设为不可见
+    // （保留布局，虚拟列表照常测量），「最新微博」的内容请求完成后再显示。
+    // 遮罩有时长上限，切换失败时内容照样显示，不会一直空白。
+    const LATEST_MASK_ATTR = 'data-__wb_latest_timeline_pending';
+    const LATEST_MASK_STYLE_ID = 'wb-retro-latest-timeline-mask';
+    const LATEST_MASK_MAX_MS = 5000;
+    const LATEST_MASK_RELEASE_DELAY_MS = 80;
+    const LATEST_MASK_CAP_CHANNEL = 'timeline-latest-mask-cap';
+    const LATEST_MASK_RELEASE_CHANNEL = 'timeline-latest-mask-release';
+    // 「全部关注」的时间线接口。地址已是「最新微博」却请求了它，说明微博前端
+    // 沿用了「全部关注」的分栏状态：地址与高亮都对，内容不对。
+    const ALL_FOLLOWING_FEED_RE = /\/ajax\/feed\/unreadfriendstimeline(?:[?#]|$)/;
+    const HOME_FEED_RE = /\/ajax\/feed\/[a-z]*timeline(?:[?#]|$)/i;
+    const MISMATCH_MAX_CLICKS = 2;
+
+    const perfNow = () =>
+      typeof performance !== 'undefined' &&
+      typeof performance.now === 'function'
+        ? performance.now()
+        : 0;
+    const canObserveFeedRequests = () =>
+      typeof PerformanceObserver === 'function';
+
+    // 遮罩等待的是"该时刻之后发起的分组时间线请求完成"。早于该时刻发起的请求
+    // 属于切换之前的分栏，不能作为放行依据。
+    let maskReleaseAfter = -1;
+    // 当前地址生效的时刻。在它之前已经返回的「全部关注」请求属于上一个地址，
+    // 微博已经处理完毕；在它之后才返回的请求，即使发起得更早，结果也会落到
+    // 当前分栏上——分栏条已挂载时脚本在约 50ms 内就点击切换，此时「全部关注」
+    // 的请求还没返回，返回后页面标题与内容回到「全部关注」。
+    let routeArrivedAt = perfNow();
+    let mismatchClicks = 0;
+
+    const ensureLatestMaskStyle = () => {
+      try {
+        if (document.getElementById?.(LATEST_MASK_STYLE_ID)) return;
+        const host = document.head || document.documentElement;
+        if (!host || typeof document.createElement !== 'function') return;
+        const style = document.createElement('style');
+        style.id = LATEST_MASK_STYLE_ID;
+        style.textContent = `html[${LATEST_MASK_ATTR}] #homeWrap .vue-recycle-scroller { visibility: hidden !important; }`;
+        host.appendChild(style);
+      } catch {
+        /* 遮罩只影响观感，失败时保持原生显示 */
+      }
+    };
+
+    const clearLatestMask = () => {
+      maskReleaseAfter = -1;
+      WB_INTERNAL.dom.cancel(LATEST_MASK_CAP_CHANNEL);
+      WB_INTERNAL.dom.cancel(LATEST_MASK_RELEASE_CHANNEL);
+      document.documentElement?.removeAttribute?.(LATEST_MASK_ATTR);
+    };
+
+    const setLatestMask = () => {
+      if (!canObserveFeedRequests()) return;
+      const root = document.documentElement;
+      if (!root?.setAttribute) return;
+      ensureLatestMaskStyle();
+      maskReleaseAfter = -1;
+      root.setAttribute(LATEST_MASK_ATTR, '1');
+      WB_INTERNAL.dom.schedule(
+        LATEST_MASK_CAP_CHANNEL,
+        clearLatestMask,
+        LATEST_MASK_MAX_MS
+      );
+    };
+
+    const isLatestMaskActive = () =>
+      !!document.documentElement?.hasAttribute?.(LATEST_MASK_ATTR);
+
+    const scheduleLatestMaskRelease = () => {
+      maskReleaseAfter = -1;
+      // 请求完成之后微博还要渲染一轮，稍等片刻再显示，避免露出旧列表。
+      WB_INTERNAL.dom.schedule(
+        LATEST_MASK_RELEASE_CHANNEL,
+        clearLatestMask,
+        LATEST_MASK_RELEASE_DELAY_MS
+      );
+    };
+
+    // 已经完成的分组时间线请求中，最晚的发起时刻。地址改写生效时，「最新微博」
+    // 的内容可能在到位判定之前就已经到达。
+    let lastGroupFeedStartedAt = -1;
+
+    // 已经到位，等该时刻之后发起的分组时间线请求完成再撤遮罩。
+    const releaseLatestMaskAfterNextFeed = (since) => {
+      if (!isLatestMaskActive()) return;
+      if (lastGroupFeedStartedAt >= since) {
+        scheduleLatestMaskRelease();
+        return;
+      }
+      maskReleaseAfter = since;
+    };
+
+    const endReconcile = (options = {}) => {
       if (!session) return;
+      const clickedAt = session.clickedPerfAt;
       session.observer.disconnect();
       session = null;
       WB_INTERNAL.dom.cancel(RECONCILE_CHANNEL);
+      if (options.reached) {
+        releaseLatestMaskAfterNextFeed(clickedAt);
+      } else {
+        clearLatestMask();
+      }
+    };
+
+    const isOnLatestGroupRoute = () => {
+      if (isHomeRootRoute() || !isHomeTimelineRoute()) return false;
+      const gid = readGidFromQuery(location.search);
+      if (!gid) return false;
+      return gid === (readLatestGidFromDom() || readStoredLatestGid());
+    };
+
+    // 地址是「最新微博」，微博却请求了「全部关注」的内容：点击「最新微博」让
+    // 前端按该分栏重新加载。高亮停在其他分组时属于用户的选择，不介入。
+    const handleAllFollowingFeed = (entry) => {
+      if (!timelineDefault.value || session) return;
+      const landedAt = Number(entry.responseEnd) || entry.startTime;
+      if (landedAt < routeArrivedAt) return;
+      if (!isOnLatestGroupRoute() || userJustChoseAnotherTab()) return;
+      if (mismatchClicks >= MISMATCH_MAX_CLICKS) return;
+      const latest = findTimelineTabElement(LATEST_TITLE);
+      const allFollowing = findTimelineTabElement(TIMELINE_TAB_TITLES[0]);
+      if (!latest) return;
+      if (!isTimelineTabActive(latest) && !isTimelineTabActive(allFollowing)) {
+        return;
+      }
+      mismatchClicks += 1;
+      setLatestMask();
+      const clickedAt = perfNow();
+      latest.click();
+      releaseLatestMaskAfterNextFeed(clickedAt);
+    };
+
+    const handleGroupFeed = (entry) => {
+      lastGroupFeedStartedAt = Math.max(lastGroupFeedStartedAt, entry.startTime);
+      if (maskReleaseAfter < 0 || entry.startTime < maskReleaseAfter) return;
+      scheduleLatestMaskRelease();
+    };
+
+    // 只读的资源计时观察：不改写 fetch / XMLHttpRequest，也不读取响应内容。
+    const observeHomeFeedRequests = () => {
+      if (!canObserveFeedRequests()) return;
+      try {
+        new PerformanceObserver((list) => {
+          list.getEntries().forEach((entry) => {
+            let path = '';
+            try {
+              path = new URL(entry.name, location.origin).pathname;
+            } catch {
+              return;
+            }
+            if (!HOME_FEED_RE.test(path)) return;
+            if (ALL_FOLLOWING_FEED_RE.test(path)) handleAllFollowingFeed(entry);
+            else handleGroupFeed(entry);
+          });
+        }).observe({ type: 'resource' });
+      } catch {
+        /* 不支持资源计时观察时，到位即撤遮罩，内容校验不可用 */
+      }
     };
 
     const reconcileTick = () => {
       if (!session) return;
       session.tickedAt = Date.now();
+      if (reachedLatestTab()) {
+        endReconcile({ reached: true });
+        return;
+      }
       if (
         !timelineDefault.value ||
         !isHomeTimelineRoute() ||
-        reachedLatestTab() ||
         userJustChoseAnotherTab() ||
         session.clicks >= RECONCILE_MAX_CLICKS ||
         Date.now() > session.deadline
@@ -1064,9 +1235,15 @@
       }
 
       const btn = findTimelineTabElement(LATEST_TITLE);
-      if (btn && Date.now() - session.clickedAt >= RECONCILE_MIN_CLICK_GAP_MS) {
+      const sinceClick = Date.now() - session.clickedAt;
+      const switchInFlight =
+        session.clicks > 0 &&
+        isTimelineTabActive(btn) &&
+        sinceClick < RECONCILE_SWITCH_SETTLE_MS;
+      if (btn && !switchInFlight && sinceClick >= RECONCILE_MIN_CLICK_GAP_MS) {
         session.clicks += 1;
         session.clickedAt = Date.now();
+        session.clickedPerfAt = perfNow();
         btn.click();
       }
 
@@ -1085,10 +1262,11 @@
       if (!isHomeTimelineRoute()) return;
       // 用户自己停在别的分组分栏时不介入：只有停在根路由（等同「全部关注」）
       // 或刚刚改写过地址，才说明当前应当落在「最新微博」。
-      if (!isHomeRootRoute() && !rewroteRootRoute) return;
+      if (!isHomeRootRoute() && !rewriteArrivalPending) return;
       if (userJustChoseAnotherTab()) return;
       if (homeArrivalHandled) return;
       homeArrivalHandled = true;
+      rewriteArrivalPending = false;
 
       const observer = new MutationObserver(() => {
         if (!session) return;
@@ -1100,8 +1278,11 @@
         deadline: Date.now() + RECONCILE_BUDGET_MS,
         clicks: 0,
         clickedAt: 0,
+        // 没有点击就到位时（地址改写生效），以会话开始时刻为放行基准。
+        clickedPerfAt: perfNow(),
         tickedAt: 0,
       };
+      setLatestMask();
 
       // 分栏挂载会产生子树变更，据此在节点出现的同一刻发起点击；轮询覆盖
       // "节点早已存在、点击却没有生效"这类不再产生新变更的情况。
@@ -1129,6 +1310,7 @@
       if (!gid) return;
       history.replaceState(null, '', `/mygroups?gid=${gid}`);
       rewroteRootRoute = true;
+      rewriteArrivalPending = true;
       WB_INTERNAL.dom.schedule(
         REWRITE_VERIFY_CHANNEL,
         verifyRewrittenRoute,
@@ -1140,6 +1322,12 @@
     // 自动退回点击纠正。页面不可见时只是渲染被推迟，重新排期而不是判定失败。
     function verifyRewrittenRoute() {
       if (!rewroteRootRoute) return;
+      // 分栏条挂载之前用户已经离开首页时，当前页面没有分栏条可以核对，不能据此
+      // 判定 gid 失效；否则会清掉 gid，并把用户从个人主页等页面拉回首页。
+      if (!isHomeTimelineRoute()) {
+        rewroteRootRoute = false;
+        return;
+      }
       if (readLatestGidFromDom()) return;
       if (document.visibilityState !== 'visible') {
         WB_INTERNAL.dom.schedule(
@@ -1185,10 +1373,13 @@
     const handleRouteChange = () => {
       syncRelationshipPageMode();
       watchTimelineTabs();
+      routeArrivedAt = perfNow();
+      mismatchClicks = 0;
       if (!isHomeTimelineRoute()) {
         homeArrivalHandled = false;
         lastHomePath = '';
         endReconcile();
+        clearLatestMask();
         return;
       }
       if (location.pathname !== lastHomePath) {
@@ -1198,8 +1389,20 @@
       startReconcile();
     };
 
+    // 后台打开的首页可能在会话预算内一直没有完成切换，切回标签页时停在
+    // 「全部关注」。开启该设置时「全部关注」分栏被样式隐藏，用户无法亲手选中，
+    // 停在根路由只能是纠正没有生效，因此页面重新可见时补开一次会话。
+    const retryReconcileAtRoot = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (session || !isHomeRootRoute()) return;
+      homeArrivalHandled = false;
+      startReconcile();
+    };
+
     rewriteRootRouteToLatest();
+    observeHomeFeedRequests();
     WB_INTERNAL.dom.subscribeRoute('timeline-default', handleRouteChange);
+    document.addEventListener('visibilitychange', retryReconcileAtRoot);
     watchTimelineTabs();
     startReconcile();
   })();
@@ -1353,7 +1556,6 @@
     '[style*="matrix("]',
     '[style*="top:"]',
   ].join(',');
-  const MAX_418 = 3; // 连续 418 次数上限
   const MAX_FULL_SYNC_PAGES = 5000;
   const MAIN_WEIBO_HOSTS = new Set(['weibo.com', 'www.weibo.com']);
   function createSyncAbortError() {
@@ -1564,7 +1766,11 @@
         typeof data.msg === 'string' && data.msg.trim()
           ? `：${data.msg.trim()}`
           : '';
-      throw new Error(`新浪微博官方黑名单${label}失败${message}`);
+      // 接口偶尔以 HTTP 200 返回 ok: 0（如「获取屏蔽设置失败！」），稍后重试即可
+      // 读到同一页，按可重试的错误处理。
+      const error = new Error(`新浪微博官方黑名单${label}失败${message}`);
+      error.retryable = true;
+      throw error;
     }
     if (!Array.isArray(data.card_group)) {
       throw new Error(`新浪微博官方黑名单${label}响应缺少名单数据`);
@@ -1576,10 +1782,12 @@
     ) {
       throw new Error(`新浪微博官方黑名单${label}响应游标无效`);
     }
+    const total = Number(data.total);
     return {
       items: data.card_group,
       hasNextPage:
-        hasNextFilteredUsersPage(data.next_cursor) && Number(data.total) !== 0,
+        hasNextFilteredUsersPage(data.next_cursor) && total !== 0,
+      total: Number.isFinite(total) && total > 0 ? total : 0,
     };
   }
 
@@ -1587,191 +1795,430 @@
     return `/ajax/setting/getFilteredUsers?page=${page}`;
   }
 
+  // 新浪微博官方黑名单按最近拉黑在前排列，每页 20 个，接口同时给出总数。
+  // 「同步新增」从第 1 页往后读，至少读到覆盖「官方总数比上次同步时多出的部分」
+  // 的页数，之后遇到整页都已在本地名单里即停止；「完整同步」读完全部分页，
+  // 边读边保存，中断后可以从中断的页继续。
+  // 只按「整页已知即停止」判断不够：在其他设备上批量拉黑、而本地只通过右键
+  // 菜单加入了最近几个时，名单前几页全部已知，后面却是一整段缺口。
+  const OFFICIAL_SYNCED_TOTAL_KEY = 'WB_BL_official_synced_total';
+  const NEW_SYNC_MAX_PAGES = 50;
+  const STARTUP_SYNC_MAX_PAGES = 3;
+  const FULL_SYNC_COMMIT_PAGES = 10;
+  // 读完之后补读异常页及相邻页的上限。
+  const FULL_SYNC_REPAIR_MAX_PAGES = 300;
+  // 实测一次限流持续约两分钟，重试间隔 5、10、20、40、80、160 秒，合计约五分钟。
+  const SYNC_RETRY_LIMIT = 6;
+  const SYNC_RETRY_BASE_MS = 5000;
+  // 完整同步的断点。名单在中断期间可能变化，超过时限的断点不再续用。
+  const FULL_SYNC_PROGRESS_KEY = 'WB_BL_full_sync_progress';
+  const FULL_SYNC_RESUME_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+  // 出现在新浪微博官方黑名单里的 UID。官方取消拉黑之后，本地名单据此删除这些
+  // UID；只在本地屏蔽、从未出现在官方名单里的 UID 不受影响。
+  const OFFICIAL_SEEN_KEY = 'WB_BL_official_seen';
+
+  function extractUIDsFromItems(items) {
+    const uids = [];
+    items.forEach((item) => {
+      const uid = extractUIDFromScheme(item);
+      if (uid) uids.push(uid);
+    });
+    return uids;
+  }
+
+  function readOfficialSeenUIDs() {
+    return parseStoredUIDSet(_GM_getValue(OFFICIAL_SEEN_KEY, ''));
+  }
+
+  function writeOfficialSeenUIDs(uids) {
+    _GM_setValue(OFFICIAL_SEEN_KEY, Array.from(uids).join(','));
+  }
+
+  function rememberOfficialUIDs(uids) {
+    const seen = readOfficialSeenUIDs();
+    const before = seen.size;
+    uids.forEach((uid) => {
+      if (/^\d{5,}$/.test(String(uid || ''))) seen.add(String(uid));
+    });
+    if (seen.size !== before) writeOfficialSeenUIDs(seen);
+  }
+
+  function readFullSyncProgress() {
+    const raw = _GM_getValue(FULL_SYNC_PROGRESS_KEY, null);
+    if (!raw || typeof raw !== 'object') return null;
+    const nextPage = Number(raw.nextPage);
+    const startedAt = Number(raw.startedAt);
+    const updatedAt = Number(raw.updatedAt);
+    if (!Number.isInteger(nextPage) || nextPage < 2) return null;
+    if (!Number.isFinite(updatedAt)) return null;
+    if (Date.now() - updatedAt > FULL_SYNC_RESUME_MAX_AGE_MS) return null;
+    return {
+      nextPage,
+      startedAt: Number.isFinite(startedAt) ? startedAt : updatedAt,
+      total: Math.max(0, Number(raw.total) || 0),
+      pageSize: Math.max(0, Number(raw.pageSize) || 0),
+      seen: parseStoredUIDSet(raw.seen),
+      suspectPages: new Set(
+        String(raw.suspectPages || '')
+          .split(',')
+          .map(Number)
+          .filter((value) => Number.isInteger(value) && value > 0)
+      ),
+    };
+  }
+
+  function writeFullSyncProgress(progress) {
+    _GM_setValue(FULL_SYNC_PROGRESS_KEY, {
+      nextPage: progress.nextPage,
+      startedAt: progress.startedAt,
+      updatedAt: Date.now(),
+      total: progress.total,
+      pageSize: progress.pageSize,
+      seen: Array.from(progress.seen).join(','),
+      suspectPages: Array.from(progress.suspectPages || []).join(','),
+    });
+  }
+
+  function clearFullSyncProgress() {
+    if (_GM_deleteValue) _GM_deleteValue(FULL_SYNC_PROGRESS_KEY);
+    else _GM_setValue(FULL_SYNC_PROGRESS_KEY, null);
+  }
+
+  function getFullSyncResumeInfo() {
+    const progress = readFullSyncProgress();
+    if (!progress) return null;
+    return {
+      nextPage: progress.nextPage,
+      loaded: progress.seen.size,
+      total: progress.total,
+      targetPages:
+        progress.total && progress.pageSize
+          ? Math.ceil(progress.total / progress.pageSize)
+          : null,
+    };
+  }
+
+  // 官方取消拉黑之后从本地名单删除。不写入本地删除记录：之后在官方重新拉黑
+  // 时，启动同步仍会把该 UID 加回本地。
+  async function removeUnblockedOfficialUIDs(uids) {
+    const targets = new Set(uids);
+    if (!targets.size) return 0;
+    return withLocalBLMutationLock(() => {
+      const stored = parseStoredUIDSet(_GM_getValue(UID_KEY, ''));
+      const exclusions = parseStoredUIDSet(
+        _GM_getValue(UID_EXCLUSION_KEY, '')
+      );
+      let removed = 0;
+      targets.forEach((uid) => {
+        if (stored.delete(uid)) removed++;
+      });
+      if (removed) _GM_setValue(UID_KEY, Array.from(stored).join(','));
+      replaceSetContents(
+        BL,
+        new Set([...stored].filter((uid) => !exclusions.has(uid)))
+      );
+      return removed;
+    });
+  }
+
+  // 请求一页官方黑名单。418（请求过于频繁）、5xx 与网络错误按指数退避重试，
+  // 超过次数后抛错；调用方保存进度之后结束本次同步。
+  async function fetchFilteredUsersPage(page, options = {}) {
+    const { signal, onWait, label = '同步' } = options;
+    let strikes = 0;
+    while (true) {
+      throwIfSyncAborted(signal);
+      let res = null;
+      try {
+        res = await WB_BL_NATIVE.fetch(buildFilteredUsersURL(page), {
+          credentials: 'include',
+          signal,
+        });
+      } catch (error) {
+        if (signal?.aborted || error?.name === 'AbortError') {
+          throw createSyncAbortError();
+        }
+        res = null;
+      }
+      let lastError = null;
+      if (res && res.ok) {
+        try {
+          const data = await res.json();
+          throwIfSyncAborted(signal);
+          return parseFilteredUsersResponse(data, label);
+        } catch (error) {
+          if (error?.name === 'AbortError') throw error;
+          // 响应体不是 JSON（例如被截断）同样稍后重试。
+          if (error instanceof SyntaxError) error.retryable = true;
+          if (!error?.retryable) throw error;
+          lastError = error;
+        }
+      } else if (res && res.status !== 418 && res.status < 500) {
+        throw new Error('HTTP ' + res.status);
+      }
+      if (++strikes > SYNC_RETRY_LIMIT) {
+        if (lastError) throw lastError;
+        throw new Error(`新浪微博请求过于频繁或网络异常，${label}已暂停`);
+      }
+      onWait?.(strikes);
+      await sleep(SYNC_RETRY_BASE_MS * 2 ** (strikes - 1), signal);
+    }
+  }
+
+  function readOfficialSyncedTotal() {
+    const value = Number(_GM_getValue(OFFICIAL_SYNCED_TOTAL_KEY, 0));
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  }
+
+  function writeOfficialSyncedTotal(total) {
+    if (Number.isFinite(total) && total > 0) {
+      _GM_setValue(OFFICIAL_SYNCED_TOTAL_KEY, Math.floor(total));
+    }
+  }
+
   /**
-   * 全量同步：只在用户手动触发或无缓存时使用
+   * 同步新增：从第 1 页往后读。官方总数比上次同步时多出的部分所在的页必须读完，
+   * 之后遇到整页都已在本地名单里即停止。没有上次同步的总数时只按整页判断。
+   * 启动时静默运行，最多读 3 页，并保留本地删除；手动运行最多读 50 页，
+   * 把官方名单里的 UID 重新加入本地。
+   */
+  async function syncNewOfficialUIDs(set, options = {}) {
+    const silent = options.silent === true;
+    if (!canUseSettingApi()) {
+      if (silent) return { added: 0, pages: 0, caughtUp: false };
+      throw new Error(SETTING_API_HOST_ERROR);
+    }
+    const { signal, onProgress } = options;
+    const maxPages = silent ? STARTUP_SYNC_MAX_PAGES : NEW_SYNC_MAX_PAGES;
+    const syncedTotal = readOfficialSyncedTotal();
+    const baseExclusions = readLocalBLExclusions();
+    const exclusions = new Set(baseExclusions);
+    const found = new Set();
+    const observed = [];
+    let page = 1;
+    let minPages = 1;
+    let officialTotal = 0;
+    let caughtUp = false;
+    while (page <= maxPages) {
+      onProgress?.({ currentPage: page, targetPages: null, loaded: found.size });
+      const parsed = await fetchFilteredUsersPage(page, {
+        signal,
+        label: '同步新增',
+        onWait: () =>
+          onProgress?.({
+            currentPage: page,
+            targetPages: null,
+            loaded: found.size,
+            waiting: true,
+          }),
+      });
+      if (page === 1) {
+        officialTotal = parsed.total;
+        const pageSize = parsed.items.length;
+        if (syncedTotal && officialTotal > syncedTotal && pageSize) {
+          minPages = Math.ceil((officialTotal - syncedTotal) / pageSize) + 1;
+        }
+      }
+      const uids = extractUIDsFromItems(parsed.items);
+      observed.push(...uids);
+      let fresh = 0;
+      uids.forEach((uid) => {
+        if (silent && exclusions.has(uid)) return;
+        if (!silent) exclusions.delete(uid);
+        if (!set.has(uid)) {
+          found.add(uid);
+          fresh++;
+        }
+      });
+      onProgress?.({ currentPage: page, targetPages: null, loaded: found.size });
+      if (
+        !uids.length ||
+        !parsed.hasNextPage ||
+        (fresh === 0 && page >= minPages)
+      ) {
+        caughtUp = true;
+        break;
+      }
+      page++;
+      if (page <= maxPages) await sleep(THROTTLE_MS, signal);
+    }
+    throwIfSyncAborted(signal);
+    rememberOfficialUIDs(observed);
+    const before = new Set(set);
+    const merged = await commitSyncedLocalBL(found, baseExclusions, exclusions);
+    replaceSetContents(set, merged);
+    // 只在确实读到了新增部分的末尾时更新基准；读到上限仍有新增时保持旧基准，
+    // 下次同步继续覆盖这段差额。
+    if (caughtUp) writeOfficialSyncedTotal(officialTotal);
+    const added = [...merged].filter((uid) => !before.has(uid)).length;
+    return { added, pages: Math.min(page, maxPages), caughtUp };
+  }
+
+  /**
+   * 完整同步：读完全部分页，每 10 页保存一次。中途取消、关闭页面或请求失败时，
+   * 已读到的 UID 已经写入本地名单，下次从中断的页继续。读完全部分页且读到的
+   * 数量与官方总数一致时，删除官方已经取消拉黑的 UID。
    */
   async function fullSync(options = {}) {
     if (!canUseSettingApi()) {
       throw new Error(SETTING_API_HOST_ERROR);
     }
     const { signal, onProgress } = options;
-    const list = [];
-    const baseExclusions = readLocalBLExclusions();
-    const exclusions = new Set(baseExclusions);
-    let page = 1,
-      strikes = 0;
-    while (true) {
-      throwIfSyncAborted(signal);
-      if (page > MAX_FULL_SYNC_PAGES) {
-        throw new Error('新浪微博官方黑名单页数异常，完整同步已停止');
-      }
-      onProgress?.({ currentPage: page, loaded: list.length });
-      const url = buildFilteredUsersURL(page);
-      const res = await WB_BL_NATIVE.fetch(url, {
-        credentials: 'include',
-        signal,
-      });
-      if (res.status === 418) {
-        if (++strikes > MAX_418) {
-          throw new Error('新浪微博请求过于频繁，完整同步未完成');
-        }
-        onProgress?.({
-          currentPage: page,
-          loaded: list.length,
-          waiting: true,
-        });
-        await sleep(3000, signal);
-        continue;
-      }
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      strikes = 0;
-      const data = await res.json();
-      throwIfSyncAborted(signal);
-      const parsed = parseFilteredUsersResponse(data, '完整同步');
-      parsed.items.forEach((item) => {
-        const uid = extractUIDFromScheme(item);
-        if (!uid) return;
-        exclusions.delete(uid);
-        list.push(uid);
-      });
-      onProgress?.({ currentPage: page, loaded: list.length });
-      if (!parsed.hasNextPage || parsed.items.length === 0) break;
-      page++;
-      await sleep(THROTTLE_MS, signal);
-    }
-    throwIfSyncAborted(signal);
-    const merged = await commitSyncedLocalBL(
-      new Set(list),
-      baseExclusions,
-      exclusions
-    );
-    return merged;
-  }
-
-  /**
-   * 增量同步：默认只跑第一页
-   */
-  async function deltaSync(set, options = {}) {
-    if (!canUseSettingApi()) {
-      if (options.silent) return set;
-      throw new Error(SETTING_API_HOST_ERROR);
-    }
-    const { signal, onProgress } = options;
-    throwIfSyncAborted(signal);
-    onProgress?.({ currentPage: 1, targetPages: 1, loaded: 0 });
-    const res = await WB_BL_NATIVE.fetch(
-      '/ajax/setting/getFilteredUsers?page=1',
-      { credentials: 'include', signal }
-    );
-    if (!res.ok) {
-      if (options.silent) return set;
-      throw new Error('HTTP ' + res.status);
-    }
-    const data = await res.json();
-    throwIfSyncAborted(signal);
-    const parsed = parseFilteredUsersResponse(data, '增量同步');
-    const workingSet = new Set(set);
-    const baseExclusions = readLocalBLExclusions();
-    const exclusions = new Set(baseExclusions);
-    const respectExclusions = options.silent === true;
+    const resume = readFullSyncProgress();
+    const seen = resume ? resume.seen : new Set();
+    const startedAt = resume ? resume.startedAt : Date.now();
+    // 含有已读 UID 或总数与前一页不同的页。接口偶尔返回与前后页不一致的结果，
+    // 分页边界随之错位，表现为一页里出现已读 UID、另一处漏掉同样数量的 UID。
+    const suspectPages = resume ? resume.suspectPages : new Set();
+    let total = resume ? resume.total : 0;
+    let pageSize = resume ? resume.pageSize : 0;
+    let page = resume ? resume.nextPage : 1;
+    let lastPage = 0;
+    let pending = new Set();
     let added = 0;
-    parsed.items.forEach((item) => {
-      const uid = extractUIDFromScheme(item);
-      if (!uid || (respectExclusions && exclusions.has(uid))) return;
-      if (!respectExclusions) exclusions.delete(uid);
-      if (!workingSet.has(uid)) {
-        workingSet.add(uid);
-        added++;
-      }
-    });
-    onProgress?.({
-      currentPage: 1,
-      targetPages: 1,
-      loaded: parsed.items.length,
-    });
-    throwIfSyncAborted(signal);
-    const merged = await commitSyncedLocalBL(
-      workingSet,
-      baseExclusions,
-      exclusions
-    );
-    replaceSetContents(set, merged);
-    return set;
-  }
 
-  /**
-   * 指定页数同步（默认 5 页）
-   * @param {Set}   set    现有 BL 集合
-   * @param {Number}pages  要同步的页数
-   * @returns {Number} 新增 UID 数
-   */
-  async function syncPages(set, pages = 5, options = {}) {
-    if (!canUseSettingApi()) {
-      throw new Error(SETTING_API_HOST_ERROR);
-    }
-    const { signal, onProgress } = options;
-    let page = 1,
-      strikes = 0,
-      added = 0;
-    const workingSet = new Set(set);
-    const baseExclusions = readLocalBLExclusions();
-    const exclusions = new Set(baseExclusions);
-    while (page <= pages) {
-      throwIfSyncAborted(signal);
-      onProgress?.({
-        currentPage: page,
-        targetPages: pages,
-        loaded: workingSet.size - set.size,
+    const targetPages = () =>
+      total && pageSize ? Math.ceil(total / pageSize) : null;
+    const flush = async () => {
+      if (!pending.size) return;
+      const batch = pending;
+      pending = new Set();
+      const baseExclusions = readLocalBLExclusions();
+      const exclusions = new Set(baseExclusions);
+      batch.forEach((uid) => exclusions.delete(uid));
+      const before = new Set(BL);
+      const merged = await commitSyncedLocalBL(batch, baseExclusions, exclusions);
+      batch.forEach((uid) => {
+        if (merged.has(uid) && !before.has(uid)) added++;
       });
-      const url = buildFilteredUsersURL(page);
-      const res = await WB_BL_NATIVE.fetch(url, {
-        credentials: 'include',
+    };
+    const saveProgress = (nextPage) =>
+      writeFullSyncProgress({
+        nextPage,
+        startedAt,
+        total,
+        pageSize,
+        seen,
+        suspectPages,
+      });
+    const readPage = (target, repairing = false) =>
+      fetchFilteredUsersPage(target, {
         signal,
+        label: '完整同步',
+        onWait: () =>
+          onProgress?.({
+            currentPage: target,
+            targetPages: targetPages(),
+            loaded: seen.size,
+            repairing,
+            waiting: true,
+          }),
       });
-      if (res.status === 418) {
-        if (++strikes > MAX_418) {
-          throw new Error('新浪微博请求过于频繁，分页同步未完成');
+    const collect = (uids) => {
+      let duplicates = 0;
+      uids.forEach((uid) => {
+        if (seen.has(uid)) {
+          duplicates++;
+          return;
+        }
+        seen.add(uid);
+        pending.add(uid);
+      });
+      return duplicates;
+    };
+
+    try {
+      while (true) {
+        if (page > MAX_FULL_SYNC_PAGES) {
+          throw new Error('新浪微博官方黑名单页数异常，完整同步已停止');
         }
         onProgress?.({
           currentPage: page,
-          targetPages: pages,
-          loaded: workingSet.size - set.size,
-          waiting: true,
+          targetPages: targetPages(),
+          loaded: seen.size,
         });
-        await sleep(3000, signal);
-        continue;
-      }
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      strikes = 0;
-      const data = await res.json();
-      throwIfSyncAborted(signal);
-      const parsed = parseFilteredUsersResponse(data, '分页同步');
-      parsed.items.forEach((item) => {
-        const uid = extractUIDFromScheme(item);
-        if (!uid) return;
-        exclusions.delete(uid);
-        if (!workingSet.has(uid)) {
-          workingSet.add(uid);
-          added++;
+        const parsed = await readPage(page);
+        if (parsed.total > 0) {
+          if (total && parsed.total !== total) suspectPages.add(page);
+          total = parsed.total;
         }
-      });
-      onProgress?.({
-        currentPage: page,
-        targetPages: pages,
-        loaded: added,
-      });
-      if (!parsed.hasNextPage || parsed.items.length === 0) break;
-      page++;
-      await sleep(THROTTLE_MS, signal);
+        if (page === 1 && parsed.items.length) pageSize = parsed.items.length;
+        if (collect(extractUIDsFromItems(parsed.items)) > 0) {
+          suspectPages.add(page);
+        }
+        const last = !parsed.hasNextPage || parsed.items.length === 0;
+        if (last) {
+          lastPage = page;
+          break;
+        }
+        if (page % FULL_SYNC_COMMIT_PAGES === 0) {
+          await flush();
+          saveProgress(page + 1);
+        }
+        page++;
+        await sleep(THROTTLE_MS, signal);
+      }
+
+      // 读到的数量少于官方总数时，重读出现过异常的页及其相邻页，补上因分页
+      // 错位漏掉的 UID。
+      if (total && seen.size < total && suspectPages.size) {
+        const repairPages = new Set();
+        suspectPages.forEach((suspect) => {
+          for (let offset = -1; offset <= 1; offset++) {
+            const target = suspect + offset;
+            if (target >= 1 && target <= lastPage) repairPages.add(target);
+          }
+        });
+        const ordered = Array.from(repairPages)
+          .sort((a, b) => a - b)
+          .slice(0, FULL_SYNC_REPAIR_MAX_PAGES);
+        for (const target of ordered) {
+          if (seen.size >= total) break;
+          await sleep(THROTTLE_MS, signal);
+          onProgress?.({
+            currentPage: target,
+            targetPages: targetPages(),
+            loaded: seen.size,
+            repairing: true,
+          });
+          const parsed = await readPage(target, true);
+          collect(extractUIDsFromItems(parsed.items));
+        }
+      }
+    } catch (error) {
+      // 已读到的 UID 先写入本地名单，再记录断点，下次从失败的页继续。
+      try {
+        await flush();
+        if (page > 1 || seen.size) saveProgress(Math.max(2, page));
+      } catch (saveError) {
+        console.warn('[WB-BL] 完整同步进度保存失败', saveError);
+      }
+      throw error;
     }
-    throwIfSyncAborted(signal);
-    const merged = await commitSyncedLocalBL(
-      workingSet,
-      baseExclusions,
-      exclusions
-    );
-    replaceSetContents(set, merged);
-    return added;
+
+    await flush();
+    clearFullSyncProgress();
+    writeOfficialSyncedTotal(total || seen.size);
+    const complete = !total || seen.size >= total;
+    let removed = 0;
+    if (complete) {
+      const previouslySeen = readOfficialSeenUIDs();
+      const unblocked = [...previouslySeen].filter((uid) => !seen.has(uid));
+      removed = await removeUnblockedOfficialUIDs(unblocked);
+      writeOfficialSeenUIDs(seen);
+    } else {
+      rememberOfficialUIDs(seen);
+    }
+    return {
+      added,
+      removed,
+      total: BL.size,
+      officialTotal: total || seen.size,
+      officialLoaded: seen.size,
+      localOnly: [...BL].filter((uid) => !seen.has(uid)).length,
+      resumedFromPage: resume ? resume.nextPage : 0,
+      complete,
+    };
   }
 
   let BL = new Set();
@@ -1867,9 +2314,8 @@
 
   const SYNC_LABELS = Object.freeze({
     startup: '新浪微博官方黑名单启动同步',
-    delta: '新浪微博官方黑名单增量同步',
-    pages: '新浪微博官方黑名单分页同步',
-    full: '新浪微博官方黑名单完整同步',
+    new: '同步新增',
+    full: '完整同步',
   });
   const syncStateListeners = new Set();
   let activeSyncTask = null;
@@ -1884,6 +2330,7 @@
       targetPages,
       loaded,
       waiting,
+      repairing,
     } = activeSyncTask;
     return {
       active: true,
@@ -1894,6 +2341,7 @@
       targetPages,
       loaded,
       waiting,
+      repairing,
     };
   }
 
@@ -1910,7 +2358,10 @@
 
   function updateSyncProgress(progress = {}) {
     if (!activeSyncTask) return;
-    Object.assign(activeSyncTask, progress, { waiting: progress.waiting === true });
+    Object.assign(activeSyncTask, progress, {
+      waiting: progress.waiting === true,
+      repairing: progress.repairing === true,
+    });
     emitSyncState();
   }
 
@@ -1961,44 +2412,33 @@
     reloadFromStorage: (options = {}) => reloadLocalBLFromStorage(options),
     fullSync: () =>
       runControlledSync('full', async (controls) => {
-        BL = await fullSync(controls);
-        refreshBlockedDOMAfterBLChange({ restoreHidden: true });
-        return BL.size;
+        const result = await fullSync(controls);
+        refreshBlockedDOMAfterBLChange({ restoreHidden: result.removed > 0 });
+        return result;
       }),
-    deltaSync: () =>
-      runControlledSync('delta', async (controls) => {
-        const before = BL.size;
-        BL = await deltaSync(BL, controls);
+    syncNew: () =>
+      runControlledSync('new', async (controls) => {
+        const result = await syncNewOfficialUIDs(BL, controls);
         refreshBlockedDOMAfterBLChange({ restoreHidden: false });
-        return {
-          added: BL.size - before,
-          total: BL.size,
-        };
+        return { ...result, total: BL.size };
       }),
-    syncPages: (pages) => {
-      const count = Math.max(1, Math.min(Number(pages) || 5, 20));
-      return runControlledSync('pages', async (controls) => {
-        const added = await syncPages(BL, count, controls);
-        refreshBlockedDOMAfterBLChange({ restoreHidden: false });
-        return {
-          added,
-          total: BL.size,
-        };
-      });
-    },
+    getFullSyncResumeInfo,
   });
   WB_INTERNAL.blSync = WB_BL_SYNC_BRIDGE;
 
   (async () => {
     syncRelationshipPageMode();
     BL = readLocalBLCache();
-    // 启动时静默合并新浪微博官方黑名单第一页。
+    // 隐藏标记靠样式生效。样式必须先于启动同步注入：同步要等一次网络往返，
+    // 这段时间里绘制前隐藏已经给条目打上标记，没有样式时条目照样显示。
+    updateRuntimeStyles();
+    // 启动时静默同步新增：最多读 3 页，保留本地删除。
     try {
-      await runControlledSync('startup', async (controls) => {
-        BL = await deltaSync(BL, { ...controls, silent: true });
-      });
+      await runControlledSync('startup', (controls) =>
+        syncNewOfficialUIDs(BL, { ...controls, silent: true })
+      );
     } catch (e) {
-      console.warn('[WB-BL] 新浪微博官方黑名单增量同步失败，继续使用本地屏蔽列表', e);
+      console.warn('[WB-BL] 新浪微博官方黑名单启动同步失败，继续使用本地屏蔽列表', e);
     }
     updateRuntimeStyles();
     refreshBlockedDOMAfterBLChange({
@@ -2237,7 +2677,12 @@
 
   function injectCSSWhenReady(cssText, styleId = '') {
     const tryInject = () => {
-      const head = document.head || document.getElementsByTagName('head')[0];
+      // document-start 阶段 head 可能尚未生成；样式挂在根元素上同样生效，
+      // 不必轮询等待 head 出现。
+      const head =
+        document.head ||
+        document.getElementsByTagName('head')[0] ||
+        document.documentElement;
       if (head) {
         const style = styleId
           ? document.getElementById(styleId) || document.createElement('style')
@@ -2531,7 +2976,10 @@
     }
     // 回包可能晚于卡片渲染到达。登记表新增条目时补一次扫描，否则这批广告要等到
     // 下一次 DOM 变动才会被隐藏。
+    // 登记表通常先于卡片渲染完成，由 MutationObserver 回调在绘制前隐藏；卡片先到
+    // 时在这里立即补扫广告，不等 60ms 的完整刷新，缩短广告可见的时长。
     if (AD_POST_OWNERS.size !== knownBefore) {
+      hideRecognizedAds(document);
       queueBlockedDOMRefresh(document, 60);
     }
   }
@@ -5489,6 +5937,7 @@
 
     try {
       await addUserToWeiboBlacklist(ctx.uid);
+      rememberOfficialUIDs([ctx.uid]);
       showUserContextToast(`已屏蔽 @${ctx.name}，并加入新浪微博官方黑名单`);
     } catch (err) {
       console.warn('[WB-BL] 新浪微博官方黑名单加入失败', err);
@@ -5920,6 +6369,35 @@
     hideBlockedCommentRoots(scope);
   }
 
+  // 只做隐藏、不做恢复的黑名单判定，供 MutationObserver 回调同步调用。微博侧与
+  // 评论侧按 refreshBlockedContent 的顺序成对执行；复核、测量壳与布局补偿留给
+  // 随后的批处理。
+  function hideBlockedContentWithoutRestore(root) {
+    if (!BL.size || !root || !root.querySelectorAll) return false;
+    if (isRelationshipListPage()) return false;
+    const nodes = [];
+    if (root instanceof Element && root.matches(DOM_UID_SELECTOR)) {
+      nodes.push(root);
+    }
+    root.querySelectorAll(DOM_UID_SELECTOR).forEach((el) => nodes.push(el));
+
+    let hiddenAny = hideBlockedSearchResultCards(root);
+    nodes.forEach((el) => {
+      const blockedUID = [...extractDOMUIDs(el)].find((uid) => BL.has(uid));
+      if (!blockedUID) return;
+      const post = findContentRootForUID(el, blockedUID);
+      if (shouldHideBlacklistDOMRoot(post) && hideContentRoot(post, blockedUID)) {
+        hiddenAny = true;
+      }
+      if (!CONTENT_FILTER_CFG.hideBlacklistComments) return;
+      const commentRoot = findCommentRootForUID(el, blockedUID);
+      if (commentRoot && hideContentRoot(commentRoot, blockedUID)) {
+        hiddenAny = true;
+      }
+    });
+    return hiddenAny;
+  }
+
   function nudgeTimelineLayout() {
     WB_INTERNAL.dom.schedule(
       'blocked-layout-primary',
@@ -6015,13 +6493,83 @@
   // === MutationObserver 过滤 ===
   (function () {
     let pendingMutations = [];
+    // 已隐藏的壳被就地改写成另一位用户的内容时，不产生新增节点，批处理只能从
+    // 属性变更里拿到它。
+    let pendingRecycledShells = new Set();
+    // 携带用户身份或条目标识的属性。Vue 复用虚拟行时只改这些属性，不插入节点。
+    const IDENTITY_ATTRIBUTE_NAMES = new Set([
+      'href',
+      'data-user-id',
+      'data-user-card',
+      'data-usercard',
+      'data-usercard-mid',
+      'data-uid',
+      'uid',
+      'usercard',
+      'nick-name',
+    ]);
+
+    // MutationObserver 回调在本轮微任务检查点执行，早于样式计算与绘制。在这里
+    // 完成隐藏，命中的条目从第一帧起就不可见，DynamicScroller 的首次测量拿到
+    // 的也是测量壳的高度；留到批处理时，条目会先绘制出来再消失，表现为闪动。
+    // 这里只做只增不减的隐藏，恢复、整篇文档复核与布局补偿仍由批处理承担。
+    const hideBeforePaint = (mutations) => {
+      if (isRelationshipListPage()) return;
+      const roots = WB_INTERNAL.dom
+        .collectAddedRoots(mutations)
+        .filter((node) => node.isConnected);
+      const recycledRoots = new Set();
+      mutations.forEach((mutation) => {
+        if (
+          mutation.type !== 'attributes' ||
+          !IDENTITY_ATTRIBUTE_NAMES.has(mutation.attributeName)
+        ) {
+          return;
+        }
+        const target = mutation.target;
+        if (!(target instanceof Element) || !target.isConnected) return;
+        recycledRoots.add(target.closest(DOM_POST_ROOT_SELECTOR) || target);
+        const hiddenShell = target.closest(BLOCKED_CONTENT_HIDE_SELECTOR);
+        if (hiddenShell) pendingRecycledShells.add(hiddenShell);
+      });
+
+      let hiddenAny = false;
+      roots.forEach((root) => {
+        if (hideRecognizedAds(root)) hiddenAny = true;
+        if (hideTimelineRecommendations(root)) hiddenAny = true;
+        if (hideBlockedContentWithoutRestore(root)) hiddenAny = true;
+      });
+      recycledRoots.forEach((root) => {
+        if (hideRecognizedAds(root)) hiddenAny = true;
+        if (hideBlockedContentWithoutRestore(root)) hiddenAny = true;
+      });
+      if (hiddenAny) {
+        WB_INTERNAL.dom.schedule(
+          'content-before-paint-layout',
+          () => {
+            compactVirtualScrollerGaps(document);
+            suppressFloatingVideoPlayers(document);
+            nudgeTimelineLayout();
+          },
+          60
+        );
+      }
+    };
+
     const processMutations = () => {
       const ms = pendingMutations;
       pendingMutations = [];
+      const recycledShells = pendingRecycledShells;
+      pendingRecycledShells = new Set();
       if (isRelationshipListPage()) {
         restoreHiddenRelationshipItems(document);
         return;
       }
+      // 复核被就地改写的已隐藏壳：仍属于被屏蔽用户的保持隐藏，其余恢复。
+      recycledShells.forEach((shell) => {
+        if (!shell.isConnected) return;
+        refreshBlockedContent(shell);
+      });
       const attributeMutations = ms.filter(
         (mutation) => mutation.type === 'attributes'
       );
@@ -6053,6 +6601,7 @@
       if (needsFullRefresh) queueBlockedDOMRefresh(document, 30);
     };
     WB_INTERNAL.dom.subscribeMutations('content-filter', (mutations) => {
+      hideBeforePaint(mutations);
       pendingMutations.push(...mutations);
       WB_INTERNAL.dom.schedule('content-mutation-batch', processMutations, 60);
     });
@@ -7445,13 +7994,13 @@
                 <div class="wbset-sec">
                   <div class="wbset-sec-title">新浪微博官方黑名单同步</div>
                   <div class="wbset-row">
-                    <button class="wbset-btn2" id="wbset-sync-delta">增量同步</button>
-                    <button class="wbset-btn2 ghost" id="wbset-sync-five">同步前 5 页</button>
+                    <button class="wbset-btn2" id="wbset-sync-new">同步新增</button>
                     <button class="wbset-btn2 ghost" id="wbset-sync-full">完整同步</button>
                     <button class="wbset-btn2 ghost" id="wbset-sync-cancel" hidden>取消同步</button>
                   </div>
                   <div class="wbset-row wbset-note wbset-sync-status" id="wbset-sync-status" role="status" aria-live="polite">当前没有正在运行的同步任务。</div>
-                  <div class="wbset-row wbset-note">分页请求之间固定等待 ${THROTTLE_MS}ms。增量同步只读取第 1 页；完整同步会遍历全部分页。本地删除会在启动时的自动同步中保留，手动同步会把新浪微博官方黑名单中的 UID 重新加入本地屏蔽列表。</div>
+                  <div class="wbset-row wbset-note">新浪微博官方黑名单按最近拉黑在前排列，每页 20 个，分页请求之间等待 ${THROTTLE_MS}ms。同步新增从第 1 页往后读取，先读完覆盖官方总数比上次同步时多出的部分的页数，之后遇到整页都已在本地屏蔽列表中即停止，最多读取 50 页；打开微博页面时会自动执行一次，最多读取 3 页。完整同步读取全部分页，名单较大时需要数分钟，期间请保持该标签页在前台；每读取 10 页保存一次，中途取消或关闭页面后，再次点击会从中断的页继续。</div>
+                  <div class="wbset-row wbset-note">完整同步读完全部分页后，在新浪微博官方取消拉黑的 UID 会从本地屏蔽列表删除；只在本地屏蔽、未出现在官方黑名单中的 UID 不受影响。本地删除的 UID 在自动同步中保持删除，手动同步会把官方黑名单中的 UID 重新加入本地屏蔽列表。</div>
                 </div>
                 <div class="wbset-sec">
                   <div class="wbset-sec-title">本地屏蔽列表备份</div>
@@ -7896,13 +8445,19 @@
 
       // 同步按钮事件：所有入口共享同一个互斥任务，并支持进度与取消。
       const syncAPI = WB_INTERNAL.blSync;
-      const syncStartButtons = [
-        panel.querySelector('#wbset-sync-delta'),
-        panel.querySelector('#wbset-sync-five'),
-        panel.querySelector('#wbset-sync-full'),
-      ];
+      const syncNewButton = panel.querySelector('#wbset-sync-new');
+      const syncFullButton = panel.querySelector('#wbset-sync-full');
+      const syncStartButtons = [syncNewButton, syncFullButton];
       const syncCancelButton = panel.querySelector('#wbset-sync-cancel');
       const syncStatus = panel.querySelector('#wbset-sync-status');
+
+      const describeIdleSyncState = () => {
+        const resume = syncAPI.getFullSyncResumeInfo();
+        syncFullButton.textContent = resume ? '继续完整同步' : '完整同步';
+        if (!resume) return '当前没有正在运行的同步任务。';
+        const pages = resume.targetPages ? ` / ${resume.targetPages}` : '';
+        return `上次完整同步停在第 ${resume.nextPage}${pages} 页，已读取 ${resume.loaded} 个 UID，点击「继续完整同步」从该页继续。`;
+      };
 
       const renderSyncState = (state) => {
         const active = state?.active === true;
@@ -7913,7 +8468,7 @@
         syncCancelButton.disabled = !active;
         syncStatus.classList.toggle('is-active', active);
         if (!active) {
-          syncStatus.textContent = '当前没有正在运行的同步任务。';
+          syncStatus.textContent = describeIdleSyncState();
           return;
         }
         const pageText = state.currentPage
@@ -7921,21 +8476,30 @@
               state.targetPages ? ` / ${state.targetPages}` : ''
             } 页`
           : '正在准备';
+        const loadedLabel = state.kind === 'full' ? '已读取' : '新增';
         const loadedText = Number.isFinite(state.loaded)
-          ? `，已处理 ${state.loaded} 个 UID`
+          ? `，${loadedLabel} ${state.loaded} 个 UID`
           : '';
-        const waitingText = state.waiting ? '，请求过于频繁，正在等待重试' : '';
-        syncStatus.textContent = `${state.label}：${pageText}${loadedText}${waitingText}`;
+        const waitingText = state.waiting
+          ? '，请求过于频繁或网络异常，正在等待重试'
+          : '';
+        const repairText = state.repairing ? '（补读分页边界不一致的页）' : '';
+        syncStatus.textContent = `${state.label}${repairText}：${pageText}${loadedText}${waitingText}`;
       };
 
       const reportSyncError = (err) => {
+        const resume = syncAPI.getFullSyncResumeInfo();
+        const resumeText = resume
+          ? `已读取的 UID 已保存，再次点击「继续完整同步」从第 ${resume.nextPage} 页继续。`
+          : '';
         if (err?.name === 'AbortError') {
-          notify('新浪微博官方黑名单同步已取消');
+          notify(`新浪微博官方黑名单同步已取消。${resumeText}`);
           return;
         }
-        notify(`❌ 新浪微博官方黑名单同步失败：${err?.message || '未知错误'}`, {
-          type: 'error',
-        });
+        notify(
+          `❌ 新浪微博官方黑名单同步失败：${err?.message || '未知错误'}。${resumeText}`,
+          { type: 'error' }
+        );
       };
 
       syncAPI.subscribe(renderSyncState);
@@ -7944,45 +8508,49 @@
         syncAPI.cancel();
       });
 
-      syncStartButtons[0].addEventListener('click', async (event) => {
+      syncNewButton.addEventListener('click', async (event) => {
         if (!isTrustedSettingsEvent(event)) return;
         try {
-          const result = await syncAPI.deltaSync();
-          notify(`✅ 官方黑名单增量同步完成！本地屏蔽列表新增 ${result.added} 个 UID`, {
-            type: 'success',
-          });
-          refreshUIDManager();
-        } catch (err) {
-          reportSyncError(err);
-        }
-      });
-
-      syncStartButtons[1].addEventListener('click', async (event) => {
-        if (!isTrustedSettingsEvent(event)) return;
-        try {
-          const result = await syncAPI.syncPages(5);
-          notify(`✅ 官方黑名单前 5 页同步完成！本地屏蔽列表新增 ${result.added} 个 UID`, {
-            type: 'success',
-          });
-          refreshUIDManager();
-        } catch (err) {
-          reportSyncError(err);
-        }
-      });
-
-      syncStartButtons[2].addEventListener('click', async (event) => {
-        if (!isTrustedSettingsEvent(event)) return;
-        try {
-          const oldSize = syncAPI.getCount();
-          const newSize = await syncAPI.fullSync();
+          const result = await syncAPI.syncNew();
+          const limitText = result.caughtUp
+            ? ''
+            : `已读取 ${result.pages} 页仍有新增，建议执行完整同步。`;
           notify(
-            `✅ 官方黑名单完整同步完成！本地屏蔽列表新增 ${newSize - oldSize} 个 UID（共 ${newSize}）`,
+            `✅ 同步新增完成：读取 ${result.pages} 页，本地屏蔽列表新增 ${result.added} 个 UID（共 ${result.total}）。${limitText}`,
             { type: 'success' }
           );
-          refreshUIDManager();
         } catch (err) {
           reportSyncError(err);
         }
+        refreshUIDManager();
+      });
+
+      syncFullButton.addEventListener('click', async (event) => {
+        if (!isTrustedSettingsEvent(event)) return;
+        try {
+          const result = await syncAPI.fullSync();
+          const parts = [
+            `官方黑名单 ${result.officialTotal} 个`,
+            `本地屏蔽列表新增 ${result.added} 个`,
+          ];
+          if (result.complete) {
+            parts.push(`删除官方已取消拉黑的 ${result.removed} 个`);
+          }
+          parts.push(`本地共 ${result.total} 个`);
+          if (result.localOnly) {
+            parts.push(`其中 ${result.localOnly} 个只在本地屏蔽`);
+          }
+          const incompleteText = result.complete
+            ? ''
+            : `官方黑名单在同步期间发生变化（读取 ${result.officialLoaded} 个，官方显示 ${result.officialTotal} 个），本次未删除任何 UID。`;
+          notify(`✅ 完整同步完成：${parts.join('，')}。${incompleteText}`, {
+            type: 'success',
+          });
+        } catch (err) {
+          reportSyncError(err);
+        }
+        refreshUIDManager();
+        renderSyncState(syncAPI.getState());
       });
 
       panel
